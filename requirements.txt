@@ -1,0 +1,26 @@
+# I'm not mentioning the specific verison of these right now but its best practive to pin versions in production.
+fastapi
+uvicorn
+pydantic
+
+portia-sdk-python
+
+sqlalchemy
+
+PyGitHub
+requests
+
+gitpython
+python-multipart
+
+jinja2
+
+python-dotenv
+pyyaml
+
+httpx
+aiofiles
+
+pytest
+black
+flake8
