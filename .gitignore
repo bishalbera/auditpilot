@@ -5,3 +5,4 @@ __pycache___
 node_modules
 .DS_Store
 .venv/
+.portia/

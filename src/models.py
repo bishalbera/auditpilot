@@ -2,11 +2,21 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, Float, Text
+from sqlalchemy import (
+    create_engine,
+    Column,
+    Integer,
+    String,
+    DateTime,
+    JSON,
+    Float,
+    Text,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 Base = declarative_base()
+
 
 class RiskLevel(str, Enum):
     LOW = "low"
@@ -14,20 +24,24 @@ class RiskLevel(str, Enum):
     HIGH = "high"
     CRITICAL = "critical"
 
+
 class ApprovalStatus(str, Enum):
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
     REQUIRES_REVIEW = "requires_review"
 
-class ComplianceFramework(str, Enum): 
+
+class ComplianceFramework(str, Enum):
     SOC2 = "SOC2"
     ISO27001 = "ISO27001"
     GDPR = "GDPR"
-    
+
+
 # Api models
 class ComplianceControl(BaseModel):
     """Compliance control definition"""
+
     framework: ComplianceFramework
     control_id: str
     title: str
@@ -35,8 +49,10 @@ class ComplianceControl(BaseModel):
     risk_level: RiskLevel
     category: str
 
+
 class RiskIndicator(BaseModel):
     """Risk indicator found in code"""
+
     pattern_type: str
     matched_text: str
     file_path: str
@@ -44,15 +60,19 @@ class RiskIndicator(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     description: str
 
+
 class ControlMapping(BaseModel):
     """Mapping between code changes and compliance controls"""
+
     control: ComplianceControl
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str
     risk_indicators: List[RiskIndicator]
 
+
 class PRAnalysis(BaseModel):
     """Complete analysis of a pull request"""
+
     pr_id: str
     title: str
     pr_url: str
@@ -67,19 +87,23 @@ class PRAnalysis(BaseModel):
     control_mappings: List[ControlMapping]
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
+
 class EvidenceBundle(BaseModel):
     """Generated evidence bundle for audit"""
+
     bundle_id: str
     pr_analysis: PRAnalysis
     executive_summary: str
     technical_details: str
     control_impact_assessment: str
     risk_mitigation_plan: str
-    audit_trial: List[Dict[str, Any]]
+    audit_trail: List[Dict[str, Any]]
     generated_at: datetime = Field(default_factory=datetime.utcnow)
 
+
 class ApprovalRequest(BaseModel):
-    """Request for humal approval"""
+    """Request for human approval"""
+
     request_id: str
     pr_analysis: PRAnalysis
     evidence_bundle: EvidenceBundle
@@ -89,9 +113,10 @@ class ApprovalRequest(BaseModel):
     reviewed_at: Optional[datetime] = None
     comments: Optional[str] = None
 
+
 # SQLAlchemy models for db
 class PRAnalysisDB(Base):
-    __tablename__ = 'pr_analysis'
+    __tablename__ = "pr_analysis"
 
     id = Column(Integer, primary_key=True, index=True)
     pr_id = Column(String, unique=True, index=True)
@@ -108,8 +133,9 @@ class PRAnalysisDB(Base):
     control_mappings = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
 class EvidenceBundleDB(Base):
-    __tablename__ = 'evidence_bundles'
+    __tablename__ = "evidence_bundles"
 
     id = Column(Integer, primary_key=True, index=True)
     bundle_id = Column(String, unique=True, index=True)
@@ -118,8 +144,9 @@ class EvidenceBundleDB(Base):
     technical_details = Column(Text)
     control_impact_assessment = Column(Text)
     risk_mitigation_plan = Column(Text)
-    audit_trial = Column(JSON)
+    audit_trail = Column(JSON)
     generated_at = Column(DateTime, default=datetime.utcnow)
+
 
 class ApprovalRequestDB(Base):
     __tablename__ = "approval_requests"
@@ -134,6 +161,7 @@ class ApprovalRequestDB(Base):
     reviewed_at = Column(DateTime, nullable=True)
     comments = Column(Text, nullable=True)
 
+
 class ComplianceControlDB(Base):
     __tablename__ = "compliance_controls"
 
@@ -145,12 +173,14 @@ class ComplianceControlDB(Base):
     risk_level = Column(String)
     category = Column(String)
 
+
 # Database setup
 def create_database(database_url: str):
     """Create the database and tables"""
     engine = create_engine(database_url)
     Base.metadata.create_all(bind=engine)
     return engine
+
 
 def get_session(database_url: str):
     """Get SQLAlchemy session"""

@@ -1,0 +1,14 @@
+# SOC2 Control Mappings for Demo
+controls:
+  CC6.1:
+    title: "Logical Access - Authentication"
+    category: "Common Criteria"
+    risk_level: "HIGH"
+  CC6.2:
+    title: "Logical Access - User Authentication"
+    category: "Common Criteria"
+    risk_level: "HIGH"
+  CC7.2:
+    title: "System Operations - System Monitoring"
+    category: "Common Criteria"
+    risk_level: "MEDIUM"

@@ -1,5 +1,5 @@
 from typing import List, Dict, Tuple
-from github import Github, PullRequest
+from github import Github
 from src.models import PRAnalysis, RiskIndicator, RiskLevel
 from src.config import RISK_PATTERNS, settings
 
@@ -8,42 +8,64 @@ class PRAnalyzer:
     """Analyzes Pull Requests for compliance risks"""
 
     def __init__(self, github_token: str = None):
-        self.github = Github(github_token or settings.github_token)
+        self.github = (
+            Github(github_token or settings.github_token)
+            if (github_token or settings.github_token)
+            else None
+        )
         self.risk_patterns = RISK_PATTERNS
 
-    async def analyze_pr(self, repo_name: str, pr_number: int) -> PRAnalysis:
-        """Main method to analyze a Pull Request"""
-        repo = self.github.get_repo(repo_name)
-        pr = repo.get_pull(pr_number)
+    def analyze_pr(self, repo_name: str, pr_number: int) -> PRAnalysis:
+        """Main method to analyze a Pull Request (synchronous).
+        Falls back to a synthetic demo analysis when GitHub is unavailable or the repo is a known demo repo.
+        """
+        # Demo repos we intentionally synthesize
+        demo_repos = {
+            "acme-corp/user-service": "authentication",
+            "acme-corp/data-service": "data_access",
+            "acme-corp/crypto-service": "encryption",
+        }
 
-        # Get basic PR info
-        # pr_data = self._extract_pr_data(pr)
+        # If no GitHub token configured or this is a demo repo, use demo analysis
+        use_demo = (self.github is None) or (repo_name in demo_repos)
 
-        # Analyze changed files
-        files_analysis = await self._analyze_changed_files(pr)
+        if not use_demo:
+            try:
+                repo = self.github.get_repo(repo_name)
+                pr = repo.get_pull(pr_number)
 
-        # Detect risk indicators
-        risk_indicators = self._detect_risk_indicators(files_analysis, pr)
+                # Analyze changed files
+                files_analysis = self._analyze_changed_files(pr)
 
-        # Calculate risk score and level
-        risk_score, risk_level = self._calculate_risk_score(risk_indicators)
+                # Detect risk indicators
+                risk_indicators = self._detect_risk_indicators(files_analysis, pr)
 
-        return PRAnalysis(
-            pr_id=f"{repo_name}#{pr_number}",
-            pr_url=pr.html_url,
-            title=pr.title,
-            description=pr.body,
-            author=pr.user.login,
-            files_changed=[f["filename"] for f in files_analysis],
-            additions=pr.additions,
-            deletions=pr.deletions,
-            risk_level=risk_level,
-            risk_score=risk_score,
-            risk_indicators=risk_indicators,
-            control_mappings=[],  # Will be populated by ControlMapper
-        )
+                # Calculate risk score and level
+                risk_score, risk_level = self._calculate_risk_score(risk_indicators)
 
-    def _extract_pr_data(self, pr: PullRequest) -> Dict:
+                return PRAnalysis(
+                    pr_id=f"{repo_name}#{pr_number}",
+                    pr_url=pr.html_url,
+                    title=pr.title,
+                    description=pr.body,
+                    author=pr.user.login,
+                    files_changed=[f["filename"] for f in files_analysis],
+                    additions=pr.additions,
+                    deletions=pr.deletions,
+                    risk_level=risk_level,
+                    risk_score=risk_score,
+                    risk_indicators=risk_indicators,
+                    control_mappings=[],  # Will be populated by ControlMapper
+                )
+            except Exception:
+                # Fallback to demo if GitHub lookups fail (e.g., 404 for non-existent repo)
+                use_demo = True
+
+        if use_demo:
+            theme = demo_repos.get(repo_name, "authentication")
+            return self._analyze_demo(repo_name, pr_number, theme)
+
+    def _extract_pr_data(self, pr) -> Dict:
         """Extract basic data from PR"""
         return {
             "title": pr.title,
@@ -55,7 +77,127 @@ class PRAnalyzer:
             "commits": pr.commits,
         }
 
-    async def _analyze_changed_files(self, pr: PullRequest) -> List[Dict]:
+    def _analyze_demo(self, repo_name: str, pr_number: int, theme: str) -> PRAnalysis:
+        """Produce a synthetic PRAnalysis for demo scenarios without calling GitHub."""
+        # Fabricate a PR-like object
+        title_map = {
+            "authentication": "Refactor auth middleware to support MFA",
+            "data_access": "Introduce repository layer and tighten DB queries",
+            "encryption": "Upgrade TLS config and rotate encryption keys",
+        }
+        title = title_map.get(theme, "Update service components and configs")
+        author = "demo-bot"
+        html_url = f"https://github.com/{repo_name}/pull/{pr_number}"
+
+        # Create synthetic changed files with patches including keywords
+        if theme == "authentication":
+            files = [
+                {
+                    "filename": "src/auth/middleware.py",
+                    "patch": "+ def verify_token(token):\n+    # TODO: add MFA\n",
+                },
+                {
+                    "filename": "src/routes/login.py",
+                    "patch": "+ return create_session(user)\n",
+                },
+            ]
+        elif theme == "data_access":
+            files = [
+                {
+                    "filename": "src/db/repository.py",
+                    "patch": "+ def query_users():\n+    return db.execute('SELECT * FROM users')\n",
+                },
+                {
+                    "filename": "src/services/user_service.py",
+                    "patch": "+ user = repo.get_user(id)\n",
+                },
+            ]
+        else:  # encryption
+            files = [
+                {
+                    "filename": "src/crypto/ssl_config.py",
+                    "patch": "+ context.set_ciphers('TLS_AES_256_GCM_SHA384')\n",
+                },
+                {
+                    "filename": "src/crypto/keys.py",
+                    "patch": "+ def rotate_keys():\n+    # rotate encryption keys\n",
+                },
+            ]
+
+        # Convert to RiskIndicators by reusing the code paths
+        class _PseudoPR:
+            def __init__(
+                self, title, body, user_login, additions=42, deletions=7, html_url=""
+            ):
+                self.title = title
+                self.body = body
+                self.user = type("U", (), {"login": user_login})
+                self.additions = additions
+                self.deletions = deletions
+                self.html_url = html_url
+
+            def get_files(self):
+                class F:
+                    def __init__(self, filename, patch):
+                        self.filename = filename
+                        self.status = "modified"
+                        self.additions = 10
+                        self.deletions = 2
+                        self.changes = 12
+                        self.patch = patch
+
+                return [F(f["filename"], f.get("patch", "")) for f in files]
+
+            def get_commits(self):
+                class C:
+                    def __init__(self, msg):
+                        self.commit = type("CM", (), {"message": msg})
+
+                msgs = {
+                    "authentication": ["add auth check", "fix login flow"],
+                    "data_access": ["optimize SQL query", "add repository pattern"],
+                    "encryption": ["update TLS", "rotate keys"],
+                }[theme]
+                return [C(m) for m in msgs]
+
+        pseudo_pr = _PseudoPR(title, f"Demo PR for {theme}", author, html_url=html_url)
+        files_analysis = [
+            {
+                "filename": f["filename"],
+                "status": "modified",
+                "additions": 10,
+                "deletions": 2,
+                "changes": 12,
+                "patch": f.get("patch", ""),
+                "contents": f.get("patch", ""),
+            }
+            for f in files
+        ]
+
+        risk_indicators = []
+        risk_indicators.extend(self._analyze_file_paths(files_analysis))
+        risk_indicators.extend(self._analyze_code_content(files_analysis))
+        risk_indicators.extend(self._analyze_commit_messages(pseudo_pr))
+        risk_indicators.extend(self._analyze_pr_text(pseudo_pr))
+
+        risk_score, risk_level = self._calculate_risk_score(risk_indicators)
+
+        return PRAnalysis(
+            pr_id=f"{repo_name}#{pr_number}",
+            pr_url=html_url,
+            title=title,
+            description=f"Demo analysis for {theme}",
+            author=author,
+            files_changed=[f["filename"] for f in files],
+            additions=42,
+            deletions=7,
+            risk_level=risk_level,
+            risk_score=risk_score,
+            risk_indicators=risk_indicators,
+            control_mappings=[],
+        )
+
+    def _analyze_changed_files(self, pr) -> List[Dict]:
         """Analyze all changed files in the PR"""
         files_analysis = []
 
@@ -67,13 +209,13 @@ class PRAnalyzer:
                 "deletions": file.deletions,
                 "changes": file.changes,
                 "patch": file.patch if hasattr(file, "patch") else "",
-                "contents": await self._get_file_contents(file),
+                "contents": self._get_file_contents(file),
             }
             files_analysis.append(file_analysis)
 
         return files_analysis
 
-    async def _get_file_contents(self, file) -> str:
+    def _get_file_contents(self, file) -> str:
         """Get file contents for analysis"""
         try:
             if hasattr(file, "patch") and file.patch:
@@ -84,7 +226,7 @@ class PRAnalyzer:
             return ""
 
     def _detect_risk_indicators(
-        self, files_analysis: List[Dict], pr: PullRequest
+        self, files_analysis: List[Dict], pr
     ) -> List[RiskIndicator]:
         """Detect risk indicators in the PR"""
         risk_indicators = []
@@ -197,7 +339,7 @@ class PRAnalyzer:
 
         return min(1.0, max(0.0, base_confidence))
 
-    def _analyze_commit_messages(self, pr: PullRequest) -> List[RiskIndicator]:
+    def _analyze_commit_messages(self, pr) -> List[RiskIndicator]:
         """Analyze commit messages for risk indicators"""
         indicators = []
 
@@ -223,7 +365,7 @@ class PRAnalyzer:
 
         return indicators
 
-    def _analyze_pr_text(self, pr: PullRequest) -> List[RiskIndicator]:
+    def _analyze_pr_text(self, pr) -> List[RiskIndicator]:
         """Analyze PR title and description"""
         indicators = []
         text_content = f"{pr.title} {pr.body or ''}".lower()
