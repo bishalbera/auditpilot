@@ -16,29 +16,23 @@ from .config import settings
 from .models import get_session, PRAnalysisDB, EvidenceBundleDB
 from .agent.compliance_agent import ComplianceAgent
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
 app = FastAPI(
     title="Compliance Copilot",
     description="AI-powered compliance automation for development workflows",
     version="1.0.0",
 )
 
-# Initialize database
 SessionLocal = get_session(settings.database_url)
 
-# Initialize agent (singleton)
 compliance_agent = ComplianceAgent()
 
-# Static files and templates
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 
-# Dependency to get database session
 def get_db():
     db = SessionLocal()
     try:
@@ -47,7 +41,6 @@ def get_db():
         db.close()
 
 
-# Verify GitHub webhook signature
 def verify_github_signature(request: Request, payload: bytes) -> bool:
     """Verify GitHub webhook signature"""
     if not settings.github_webhook_secret:
@@ -67,7 +60,6 @@ def verify_github_signature(request: Request, payload: bytes) -> bool:
     return hmac.compare_digest(signature_header, expected_signature)
 
 
-# Root endpoint
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     """Main dashboard"""
@@ -87,77 +79,31 @@ async def health_check():
     }
 
 
-# Enhanced compliance analysis execution with flexible methods
 async def execute_compliance_analysis(
     repo_name: str,
     pr_number: int,
     policy_refs: Optional[list] = None,
     demo: bool = False,
-    execution_mode: str = "structured",
-    custom_instruction: Optional[str] = None,
 ):
     """
-    Execute the Portia-based compliance analysis with multiple execution modes.
+    Execute the Portia-based compliance analysis.
 
     Args:
         repo_name: Repository name (e.g., "org/repo")
         pr_number: Pull request number
         policy_refs: List of policy frameworks (SOC2, ISO27001, etc.)
         demo: Whether this is demo/test mode
-        execution_mode: "structured" (run_plan) or "natural" (run_plain)
-        custom_instruction: Custom instruction for natural language mode
     """
     try:
-        logger.info(
-            f"🚀 Starting compliance analysis for {repo_name}#{pr_number} (mode: {execution_mode})"
+        logger.info(f"🚀 Starting compliance analysis for {repo_name}#{pr_number}")
+        logger.info("⚙️ Using structured plan execution")
+
+        plan_result = await compliance_agent.run_plan(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            policy_refs=policy_refs or [],
+            demo=demo,
         )
-
-        if execution_mode == "natural" and custom_instruction:
-            # Use run_plain with custom instruction
-            logger.info("🧠 Using natural language mode with custom instruction")
-            plan_result = await compliance_agent.run_plain(
-                instruction=custom_instruction,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                policy_frameworks=policy_refs or ["SOC2"],
-                demo_mode=demo,
-                execution_context="webhook_triggered",
-            )
-
-        elif execution_mode == "natural":
-            # Use run_plain with default instruction
-            logger.info("🧠 Using natural language mode with default workflow")
-            default_instruction = f"""
-            Analyze pull request #{pr_number} in repository {repo_name} for compliance risks.
-
-            Complete workflow:
-            1. Analyze the PR for compliance risks and map to relevant controls
-            2. Generate comprehensive evidence documentation
-            3. Check if human approval is needed for high-risk changes
-            4. Save all results to the database
-            5. Prepare team notification if this analysis reveals significant findings
-
-            Focus on identifying security, privacy, and compliance impacts.
-            """
-
-            plan_result = await compliance_agent.run_plain(
-                instruction=default_instruction,
-                repo_name=repo_name,
-                pr_number=pr_number,
-                policy_frameworks=policy_refs or ["SOC2"],
-                demo_mode=demo,
-                execution_context="webhook_triggered",
-            )
-
-        else:
-            # Use structured run_plan (default)
-            logger.info("⚙️ Using structured plan execution")
-            plan_result = await compliance_agent.run_plan(
-                repo_name=repo_name,
-                pr_number=pr_number,
-                policy_refs=policy_refs or [],
-                demo=demo,
-            )
 
         logger.info(f"✅ Compliance analysis completed for {repo_name}#{pr_number}")
 
@@ -171,10 +117,6 @@ async def execute_compliance_analysis(
             f"❌ Compliance analysis failed for {repo_name}#{pr_number}: {str(e)}",
             exc_info=True,
         )
-
-        # TODO: Fix failure notification - temporarily disabled due to event loop issues
-        # asyncio.create_task(send_failure_notification(repo_name, pr_number, str(e)))
-
         raise
 
 
@@ -205,36 +147,6 @@ async def log_analysis_results(plan_result, repo_name: str, pr_number: int):
         logger.warning(f"⚠️ Could not extract detailed results: {e}")
 
 
-async def send_failure_notification(repo_name: str, pr_number: int, error_message: str):
-    """Send failure notification (could be Slack, email, etc.)"""
-    try:
-        # This could be enhanced to use your notification system
-        failure_instruction = f"""
-        Send an alert about a failed compliance analysis.
-
-        Details:
-        - Repository: {repo_name}
-        - PR Number: {pr_number}
-        - Error: {error_message}
-        - Timestamp: {datetime.utcnow().isoformat()}
-
-        Send this to the appropriate channel or notification system.
-        """
-
-        # Use run_plain for failure notifications
-        await compliance_agent.run_plain(
-            instruction=failure_instruction,
-            repo_name=repo_name,
-            pr_number=pr_number,
-            error_context=error_message,
-            notification_type="failure_alert",
-        )
-
-    except Exception as e:
-        logger.error(f"❌ Failed to send failure notification: {e}")
-
-
-# GitHub webhook endpoint - CORRECTED
 @app.post("/webhooks/github")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     """
@@ -322,7 +234,7 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         )
 
 
-# List recent analyses with enhanced information
+# List recent analyses
 @app.get("/analyses")
 async def list_analyses(limit: int = 20, db: Session = Depends(get_db)):
     """List recent PR analyses with evidence bundle information"""
@@ -367,7 +279,7 @@ async def list_analyses(limit: int = 20, db: Session = Depends(get_db)):
         return {"analyses": result, "total_count": len(result)}
 
     except Exception as e:
-        logger.error(f"❌ Failed to list analyses: {str(e)}", exc_info=True)
+        logger.error(f"Failed to list analyses: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"Failed to list analyses: {str(e)}"
         )
@@ -385,8 +297,7 @@ async def get_agent_stats():
                 settings.database_url.split("@")[-1]
                 if "@" in settings.database_url
                 else "local"
-            ),  # Hide credentials
-            "slack_integration": "configured",  # Assuming Slack is configured via Portia
+            ),
         }
     )
     return stats

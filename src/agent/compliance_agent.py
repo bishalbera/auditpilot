@@ -1,23 +1,26 @@
 import json
 import logging
-import uuid
 from typing import Any, Dict, List, Optional
 
+from portia import (
+    Config,
+    LLMProvider,
+    Portia,
+    Tool,
+    ToolRegistry,
+    ToolRunContext,
+    ToolHardError,
+)
 from pydantic import BaseModel, Field
-from portia import Config, LLMProvider, Portia, ToolRegistry
-from portia import PlanBuilderV2, StepOutput, Input, ToolRunContext
-from portia.clarification import Clarification
+
+from src.analysis.pr_analyzer import PRAnalyzer
+from src.evidence.evidence_generator import EvidenceGenerator
+from src.mapping.control_mapper import ControlMapper
+from src.models import PRAnalysis
+from src.config import settings
+from portia import PlanBuilderV2, StepOutput, Input
 from portia.end_user import EndUser
-from portia.tool import Tool
 
-# Local imports
-from ..analysis.pr_analyzer import PRAnalyzer
-from ..config import settings
-from ..evidence.evidence_generator import EvidenceGenerator
-from ..mapping.control_mapper import ControlMapper
-from ..models import EvidenceBundle, PRAnalysis
-
-# Configure logger
 logger = logging.getLogger(__name__)
 
 
@@ -195,220 +198,10 @@ class GenerateEvidenceBundleTool(Tool[GenerateEvidenceOutput]):
 
         except Exception as exc:
             logger.error(f"Error in GenerateEvidenceBundleTool: {exc}", exc_info=True)
-            # Return a minimal fallback evidence bundle
-            fallback_bundle_id = f"bundle-{uuid.uuid4().hex[:8]}"
-            fallback_dict = {
-                "bundle_id": fallback_bundle_id,
-                "pr_analysis": (
-                    pr_analysis_dict if "pr_analysis_dict" in locals() else {}
-                ),
-                "executive_summary": "Evidence generation failed - fallback bundle created",
-                "technical_details": f"Error occurred: {str(exc)}",
-                "control_impact_assessment": "Manual review required",
-                "risk_mitigation_plan": "Manual mitigation planning required",
-                "audit_trail": [],
-                "created_at": None,
-            }
-            logger.info(f"Returning fallback evidence bundle: {fallback_bundle_id}")
-            return GenerateEvidenceOutput(
-                status="success",
-                bundle_id=fallback_bundle_id,
-                evidence_bundle=fallback_dict,
-            )
+            # Return an error response instead of raising to avoid breaking the pipeline
+            raise ToolHardError(f"Something went wrong {exc}")
 
 
-# ---------- LLM-backed assistive tools (schema-validated, approval-gated) ----------
-class EvidenceItem(BaseModel):
-    control_id: str
-    summary: str
-    artifacts: List[str] = Field(default_factory=list)
-    risk: Optional[str] = None
-    rationale: Optional[str] = None
-
-
-class DraftEvidenceInput(BaseModel):
-    pr_id: str
-    repo: str
-    analysis: Dict[str, Any]
-    mapped_controls: List[Dict[str, Any]]
-    policy_refs: List[str] = Field(default_factory=list)
-
-
-class DraftEvidenceOutput(BaseModel):
-    items: List[EvidenceItem]
-    overall_summary: str
-    confidence: float = Field(ge=0.0, le=1.0)
-
-    class Config:
-        json_encoders = {
-            # Handle any special types that need custom serialization
-        }
-
-
-class DraftEvidenceTextTool(Tool[DraftEvidenceOutput]):
-    """Draft evidence text per control using the configured LLM, falling back to a deterministic stub if LLM is unavailable."""
-
-    id: str = "draft_evidence_text"
-    name: str = "Draft Evidence Text Tool"
-    description: str = (
-        "Draft evidence text per control using LLM with approval gates for high risk items"
-    )
-    args_schema: type[BaseModel] = DraftEvidenceInput
-    output_schema: tuple[str, str] = (
-        "DraftEvidenceOutput",
-        "Drafted evidence text with confidence scoring and approval gates",
-    )
-
-    async def run(
-        self,
-        ctx: ToolRunContext,
-        pr_id: str,
-        repo: str,
-        analysis: Dict[str, Any],
-        mapped_controls: List[Dict[str, Any]],
-        policy_refs: List[str] = None,
-    ) -> DraftEvidenceOutput:
-        """Run the DraftEvidenceTextTool."""
-        if policy_refs is None:
-            policy_refs = []
-
-        # Try LLM JSON completion if available
-        try:
-            if hasattr(ctx, "llm") and hasattr(ctx.llm, "json"):
-                system = "You are a compliance evidence assistant. Output JSON conforming to the schema."
-                prompt = {
-                    "system": system,
-                    "rules_refs": policy_refs,
-                    "analysis": analysis,
-                    "mapped_controls": mapped_controls,
-                    "instructions": [
-                        "For each mapped control, provide a concise summary, artifacts, optional risk, and rationale.",
-                        "Reference analysis fields you relied on.",
-                        "Return confidence between 0 and 1.",
-                    ],
-                }
-                result = await ctx.llm.json(prompt, schema=DraftEvidenceOutput)
-                out = DraftEvidenceOutput(**result)
-            else:
-                raise RuntimeError("LLM unavailable in context")
-        except Exception:
-            # Safe fallback: summarize deterministically
-            controls = [
-                c.get("control", {}).get("control_id", "UNKNOWN")
-                for c in mapped_controls
-            ]
-            summary = f"Draft evidence for {pr_id}: controls {', '.join(controls)} mapped; risk {analysis.get('risk_level', 'low')}"
-            out = DraftEvidenceOutput(
-                items=[
-                    EvidenceItem(
-                        control_id=cid, summary=f"Control {cid} addressed by changes."
-                    )
-                    for cid in controls
-                ],
-                overall_summary=summary,
-                confidence=0.75,
-            )
-
-        # Gate on high risk or low confidence
-        has_high_risk = any(
-            (i.risk or "").lower() in ("high", "critical") for i in out.items
-        )
-        if out.confidence < 0.7 or has_high_risk:
-            raise Clarification(
-                title=f"Approve evidence draft for {repo}#{pr_id}",
-                message="Review the generated evidence and approve to publish.",
-                payload=out.model_dump(),
-            )
-        return out
-
-
-class DraftSlackInput(BaseModel):
-    pr_id: str
-    repo: str
-    findings_summary: str
-    risks: List[str] = Field(default_factory=list)
-    link: Optional[str] = None
-    demo: bool = False
-
-
-class DraftSlackOutput(BaseModel):
-    title: str
-    body: str
-
-
-class DraftSlackMessageTool(Tool[DraftSlackOutput]):
-    """Draft Slack notification message with approval gate."""
-
-    id: str = "draft_slack_message"
-    name: str = "Draft Slack Message Tool"
-    description: str = "Draft Slack notification message with approval gate"
-    args_schema: type[BaseModel] = DraftSlackInput
-    output_schema: tuple[str, str] = (
-        "DraftSlackOutput",
-        "Drafted Slack message with title and body",
-    )
-
-    async def run(
-        self,
-        ctx: ToolRunContext,
-        pr_id: str,
-        repo: str,
-        findings_summary: str,
-        risks: List[str] = None,
-        link: Optional[str] = None,
-        demo: bool = False,
-    ) -> DraftSlackOutput:
-        """Run the DraftSlackMessageTool."""
-        if risks is None:
-            risks = []
-
-        try:
-            if hasattr(ctx, "llm") and hasattr(ctx.llm, "json"):
-                prompt = {
-                    "system": "You are a compliance notifier. Output JSON only.",
-                    "instructions": [
-                        "Title <= 80 chars; body as up to 4 bullets; include CTA with link if provided.",
-                        "If demo is true, prepend [DEMO] to title.",
-                    ],
-                    "input": {
-                        "pr_id": pr_id,
-                        "repo": repo,
-                        "findings_summary": findings_summary,
-                        "risks": risks,
-                        "link": link,
-                        "demo": demo,
-                    },
-                }
-                result = await ctx.llm.json(prompt, schema=DraftSlackOutput)
-                out = DraftSlackOutput(**result)
-            else:
-                raise RuntimeError("LLM unavailable in context")
-        except Exception:
-            prefix = "[DEMO] " if demo else ""
-            out = DraftSlackOutput(
-                title=f"{prefix}Compliance analysis for {repo}#{pr_id}",
-                body=f"• {findings_summary}\n"
-                + (f"• Risks: {', '.join(risks)}\n" if risks else "")
-                + (f"• Link: {link}" if link else ""),
-            )
-
-        # Always seek approval before sending notifications
-        raise Clarification(
-            title="Send Slack notification?",
-            message=f"Title: {out.title}\nBody:\n{out.body}",
-            payload=out.model_dump(),
-        )
-
-
-# ---------- Final output schema for plan ----------
-class FinalOutput(BaseModel):
-    analysis: AnalyzePROutput
-    evidence: GenerateEvidenceOutput
-    drafted_evidence: DraftEvidenceOutput
-    slack_draft: DraftSlackOutput
-
-
-# ---------- Persistence tool (Portia step persists to local DB) ----------
 class PersistArgs(BaseModel):
     pr_analysis: Dict[str, Any]
     evidence_bundle: Dict[str, Any]
@@ -432,7 +225,7 @@ class PersistResultsToDbTool(Tool[PersistOutput]):
         "Database persistence status with IDs",
     )
 
-    async def run(
+    def run(
         self,
         ctx: ToolRunContext,
         pr_analysis: Dict[str, Any],
@@ -443,156 +236,181 @@ class PersistResultsToDbTool(Tool[PersistOutput]):
         from ..models import get_session, PRAnalysisDB, EvidenceBundleDB
         from ..config import settings
 
+        logger.info(
+            f"PersistResultsToDbTool - Received pr_analysis type: {type(pr_analysis)}"
+        )
+        logger.info(
+            f"PersistResultsToDbTool - Received evidence_bundle type: {type(evidence_bundle)}"
+        )
+
+        # Handle JSON strings if needed
+        if isinstance(pr_analysis, str):
+            try:
+                pr_analysis = json.loads(pr_analysis)
+                logger.info("Successfully parsed pr_analysis JSON string")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse pr_analysis JSON: {e}")
+                pr_analysis = {}
+
+        if isinstance(evidence_bundle, str):
+            try:
+                evidence_bundle = json.loads(evidence_bundle)
+                logger.info("Successfully parsed evidence_bundle JSON string")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse evidence_bundle JSON: {e}")
+                evidence_bundle = {}
+
         session_factory = get_session(settings.database_url)
         db = session_factory()
-        try:
-            pr = pr_analysis or {}
-            ev = evidence_bundle or {}
 
-            if pr:
+        pr_id = None
+        bundle_id = None
+
+        try:
+            # Extract data safely
+            pr = pr_analysis if isinstance(pr_analysis, dict) else {}
+            ev = evidence_bundle if isinstance(evidence_bundle, dict) else {}
+
+            logger.info(
+                f"Processing PR data: {list(pr.keys()) if pr else 'No PR data'}"
+            )
+            logger.info(
+                f"Processing Evidence data: {list(ev.keys()) if ev else 'No Evidence data'}"
+            )
+
+            if pr and pr.get("pr_id"):
+                pr_id = pr.get("pr_id")
                 pr_row = PRAnalysisDB(
-                    pr_id=pr.get("pr_id"),
+                    pr_id=pr_id,
                     pr_url=pr.get("pr_url"),
                     title=pr.get("title"),
                     description=pr.get("description"),
                     author=pr.get("author"),
-                    files_changed=pr.get("files_changed"),
-                    additions=pr.get("additions"),
-                    deletions=pr.get("deletions"),
+                    files_changed=pr.get("files_changed", []),
+                    additions=pr.get("additions", 0),
+                    deletions=pr.get("deletions", 0),
                     risk_level=pr.get("risk_level"),
-                    risk_score=pr.get("risk_score"),
-                    risk_indicators=pr.get("risk_indicators"),
-                    control_mappings=pr.get("control_mappings"),
+                    risk_score=pr.get("risk_score", 0.0),
+                    risk_indicators=pr.get("risk_indicators", []),
+                    control_mappings=pr.get("control_mappings", []),
                 )
+
+                # Check for existing record and replace
                 existing = (
-                    db.query(PRAnalysisDB)
-                    .filter(PRAnalysisDB.pr_id == pr_row.pr_id)
-                    .first()
+                    db.query(PRAnalysisDB).filter(PRAnalysisDB.pr_id == pr_id).first()
                 )
                 if existing:
+                    logger.info(f"Replacing existing PR analysis for {pr_id}")
                     db.delete(existing)
                     db.commit()
-                db.add(pr_row)
 
-            if ev:
+                db.add(pr_row)
+                logger.info(f"Added PR analysis to database: {pr_id}")
+
+            if ev and ev.get("bundle_id"):
+                bundle_id = ev.get("bundle_id")
+                # Get pr_id from evidence bundle's pr_analysis if not set
+                if not pr_id:
+                    pr_analysis_in_ev = ev.get("pr_analysis", {})
+                    pr_id = (
+                        pr_analysis_in_ev.get("pr_id")
+                        if isinstance(pr_analysis_in_ev, dict)
+                        else None
+                    )
+
                 bundle_row = EvidenceBundleDB(
-                    bundle_id=ev.get("bundle_id"),
-                    pr_id=(ev.get("pr_analysis") or {}).get("pr_id"),
-                    executive_summary=ev.get("executive_summary"),
-                    technical_details=ev.get("technical_details"),
-                    control_impact_assessment=ev.get("control_impact_assessment"),
-                    risk_mitigation_plan=ev.get("risk_mitigation_plan"),
-                    audit_trail=ev.get("audit_trail"),
+                    bundle_id=bundle_id,
+                    pr_id=pr_id,
+                    executive_summary=ev.get("executive_summary", ""),
+                    technical_details=ev.get("technical_details", ""),
+                    control_impact_assessment=ev.get("control_impact_assessment", ""),
+                    risk_mitigation_plan=ev.get("risk_mitigation_plan", ""),
+                    audit_trail=ev.get("audit_trail", []),
                 )
+
+                # Check for existing record and replace
                 existing_b = (
                     db.query(EvidenceBundleDB)
-                    .filter(EvidenceBundleDB.bundle_id == bundle_row.bundle_id)
+                    .filter(EvidenceBundleDB.bundle_id == bundle_id)
                     .first()
                 )
                 if existing_b:
+                    logger.info(f"Replacing existing evidence bundle for {bundle_id}")
                     db.delete(existing_b)
                     db.commit()
+
                 db.add(bundle_row)
+                logger.info(f"Added evidence bundle to database: {bundle_id}")
 
             db.commit()
+            logger.info(
+                f"Successfully persisted data - PR: {pr_id}, Bundle: {bundle_id}"
+            )
+
             return PersistOutput(
                 status="persisted",
-                pr_id=pr.get("pr_id", ""),
-                bundle_id=ev.get("bundle_id", ""),
+                pr_id=pr_id or "unknown",
+                bundle_id=bundle_id or "unknown",
             )
-        except Exception:
+
+        except Exception as e:
+            logger.error(f"Error persisting data: {e}", exc_info=True)
             db.rollback()
-            raise
+            # Return an error status instead of raising to avoid breaking the pipeline
+            return PersistOutput(
+                status="error",
+                pr_id=pr_id or "unknown",
+                bundle_id=bundle_id or "unknown",
+            )
         finally:
             db.close()
 
 
-# ---------- Approval tool (raises Clarification on high risk) ----------
-class ApprovalArgs(BaseModel):
-    pr_analysis: Dict[str, Any] = Field(..., description="PRAnalysis as a dict")
-    evidence_bundle: Dict[str, Any] = Field(..., description="EvidenceBundle as a dict")
-    force_approve: bool = Field(
-        False, description="Override to auto-approve regardless of risk"
-    )
+class EvidenceItem(BaseModel):
+    control_id: str
+    summary: str
+    artifacts: List[str] = Field(default_factory=list)
+    risk: Optional[str] = None
+    rationale: Optional[str] = None
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
-class ApprovalOutput(BaseModel):
-    status: str
-    requires_human_review: bool = False
-    request_id: Optional[str] = None
-    preview: Optional[str] = None
+class DraftEvidenceInput(BaseModel):
+    pr_id: str
+    repo: str
+    analysis: Dict[str, Any]
+    mapped_controls: List[Dict[str, Any]]
+    policy_refs: List[str] = Field(default_factory=list)
 
 
-class RequestHumanApprovalTool(Tool[ApprovalOutput]):
-    """Request human approval for high-risk changes."""
-
-    id: str = "request_human_approval"
-    name: str = "Request Human Approval Tool"
-    description: str = "Request human approval for high-risk changes"
-    args_schema: type[BaseModel] = ApprovalArgs
-    output_schema: tuple[str, str] = (
-        "ApprovalOutput",
-        "Approval status with request details",
-    )
-
-    async def run(
-        self,
-        ctx: ToolRunContext,
-        pr_analysis: Dict[str, Any],
-        evidence_bundle: Dict[str, Any],
-        force_approve: bool = False,
-    ) -> ApprovalOutput:
-        """Run the RequestHumanApprovalTool."""
-        pr = PRAnalysis(**pr_analysis)
-        bundle = EvidenceBundle(**evidence_bundle)
-
-        if force_approve or pr.risk_level.value in ["low", "medium"]:
-            return ApprovalOutput(status="auto_approved", requires_human_review=False)
-
-        request_id = str(uuid.uuid4())
-        preview = (
-            f"PR {pr.pr_id} requires approval. Risk: {pr.risk_level.value} ({pr.risk_score:.2f}). "
-            f"Controls impacted: {len(pr.control_mappings)}. Bundle: {bundle.bundle_id}"
-        )
-        # Pause plan until human approves
-        raise Clarification(
-            title="Approval required",
-            message=preview,
-            payload={
-                "request_id": request_id,
-                "pr_id": pr.pr_id,
-                "bundle_id": bundle.bundle_id,
-            },
-        )
+class DraftEvidenceOutput(BaseModel):
+    items: List[EvidenceItem]
+    overall_summary: str
+    confidence: float = Field(ge=0.0, le=1.0)
 
 
-# ---------- Agent and orchestration ----------
+class FinalOutput(BaseModel):
+    analysis: Dict[str, Any]
+    evidence: Dict[str, Any]
+    drafted_evidence: DraftEvidenceOutput
+
+
 class ComplianceAgent:
-    """Main Portia-powered compliance agent with explicit orchestration."""
+    config = Config.from_default(
+        llm_provider=LLMProvider.GOOGLE,
+        default_model="google/gemini-2.0-flash",
+        google_api_key=settings.gemini_api_key,
+    )
 
-    def __init__(self):
-        self.pr_analyzer = PRAnalyzer()
-        self.control_mapper = ControlMapper()
-        self.evidence_generator = EvidenceGenerator()
+    my_tool_registry = ToolRegistry(
+        [
+            AnalyzePullRequestTool(),
+            GenerateEvidenceBundleTool(),
+            PersistResultsToDbTool(),
+        ]
+    )
 
-        config = Config.from_default(
-            llm_provider=LLMProvider.GOOGLE,
-            default_model="google/gemini-2.0-flash",
-            google_api_key=settings.gemini_api_key,
-        )
-
-        my_tool_registry = ToolRegistry(
-            [
-                AnalyzePullRequestTool(),
-                GenerateEvidenceBundleTool(),
-                DraftEvidenceTextTool(),
-                DraftSlackMessageTool(),
-                RequestHumanApprovalTool(),
-                PersistResultsToDbTool(),
-            ]
-        )
-
-        self.portia = Portia(config=config, tools=my_tool_registry)
+    portia = Portia(config=config, tools=my_tool_registry)
 
     def build_text_plan(
         self,
@@ -601,9 +419,181 @@ class ComplianceAgent:
         policy_refs: Optional[List[str]] = None,
         demo: bool = False,
     ) -> Any:
-        """Build a Portia PlanBuilderV2 plan for compliance analysis, evidence generation, and notification.
-        This follows https://docs.portialabs.ai/build-plan using explicit steps and conditionals.
-        """
+        """Build a Portia PlanBuilderV2 plan for compliance analysis, evidence generation, and notification."""
+
+        import logging
+        import json
+        from datetime import datetime
+
+        # Set up debug logger that writes to file
+        debug_log_file = f"portia_debug_{repo_name.replace('/', '_')}_{pr_number}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        debug_logger = logging.getLogger("portia_debug")
+        debug_logger.setLevel(logging.DEBUG)
+
+        # Remove existing handlers to avoid duplicates
+        for handler in debug_logger.handlers[:]:
+            debug_logger.removeHandler(handler)
+
+        # Create file handler
+        file_handler = logging.FileHandler(debug_log_file)
+        file_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        file_handler.setFormatter(formatter)
+        debug_logger.addHandler(file_handler)
+
+        def debug_log(message):
+            """Helper to log debug messages"""
+            debug_logger.debug(message)
+            # Also print to console for immediate feedback
+            print(f"DEBUG: {message}")
+
+        def extract_pr_analysis(analysis_result):
+            """Extract PR analysis from the analyze_pr step result"""
+            debug_log(f"extract_pr_analysis - Input type: {type(analysis_result)}")
+            debug_log(
+                f"extract_pr_analysis - Input content: {str(analysis_result)[:1000]}..."
+            )
+
+            # Handle JSON string (most common case with Portia)
+            if isinstance(analysis_result, str):
+                debug_log("Input is JSON string, attempting to parse")
+                try:
+                    parsed_result = json.loads(analysis_result)
+                    debug_log(f"Successfully parsed JSON, type: {type(parsed_result)}")
+                    debug_log(
+                        f"Parsed keys: {list(parsed_result.keys()) if isinstance(parsed_result, dict) else 'Not a dict'}"
+                    )
+
+                    if (
+                        isinstance(parsed_result, dict)
+                        and "pr_analysis" in parsed_result
+                    ):
+                        debug_log("Found pr_analysis in parsed JSON")
+                        return parsed_result["pr_analysis"]
+
+                except json.JSONDecodeError as e:
+                    debug_log(f"Failed to parse JSON: {e}")
+
+            # Handle AnalyzePROutput object
+            if hasattr(analysis_result, "pr_analysis"):
+                debug_log("Found pr_analysis attribute")
+                result = analysis_result.pr_analysis
+                debug_log(f"Extracted pr_analysis type: {type(result)}")
+                return result
+
+            # Handle dictionary from serialized AnalyzePROutput
+            if isinstance(analysis_result, dict):
+                debug_log(f"Input is dict with keys: {list(analysis_result.keys())}")
+                if "pr_analysis" in analysis_result:
+                    debug_log("Found pr_analysis key in dict")
+                    return analysis_result["pr_analysis"]
+
+                # Sometimes the entire dict IS the pr_analysis
+                required_fields = {"pr_id", "title", "risk_level", "files_changed"}
+                if required_fields.issubset(set(analysis_result.keys())):
+                    debug_log("Dict appears to be pr_analysis itself")
+                    return analysis_result
+
+            debug_log("Returning empty dict - no valid data found")
+            return {}
+
+        def extract_evidence_bundle(evidence_result):
+            """Extract evidence bundle from the generate_evidence step result"""
+            debug_log(f"extract_evidence_bundle - Input type: {type(evidence_result)}")
+            debug_log(
+                f"extract_evidence_bundle - Input keys: {list(evidence_result.keys()) if isinstance(evidence_result, dict) else 'Not a dict'}"
+            )
+
+            # Handle JSON string (most common case with Portia)
+            if isinstance(evidence_result, str):
+                debug_log("Input is JSON string, attempting to parse")
+                try:
+                    parsed_result = json.loads(evidence_result)
+                    debug_log(f"Successfully parsed JSON, type: {type(parsed_result)}")
+                    debug_log(
+                        f"Parsed keys: {list(parsed_result.keys()) if isinstance(parsed_result, dict) else 'Not a dict'}"
+                    )
+
+                    if (
+                        isinstance(parsed_result, dict)
+                        and "evidence_bundle" in parsed_result
+                    ):
+                        debug_log("Found evidence_bundle in parsed JSON")
+                        return parsed_result["evidence_bundle"]
+
+                except json.JSONDecodeError as e:
+                    debug_log(f"Failed to parse JSON: {e}")
+
+            # Handle GenerateEvidenceOutput object
+            if hasattr(evidence_result, "evidence_bundle"):
+                debug_log("Found evidence_bundle attribute")
+                result = evidence_result.evidence_bundle
+                debug_log(f"Extracted evidence_bundle type: {type(result)}")
+                return result
+
+            # Handle dictionary from serialized GenerateEvidenceOutput
+            if isinstance(evidence_result, dict):
+                debug_log(f"Input is dict with keys: {list(evidence_result.keys())}")
+                if "evidence_bundle" in evidence_result:
+                    debug_log("Found evidence_bundle key in dict")
+                    return evidence_result["evidence_bundle"]
+
+            debug_log("Returning empty dict - no valid evidence bundle found")
+            return {}
+
+        def extract_control_mappings(pr_analysis_data):
+            """Extract control mappings from PR analysis data"""
+            debug_log(
+                f"extract_control_mappings - Input type: {type(pr_analysis_data)}"
+            )
+            debug_log(
+                f"extract_control_mappings - Input content: {str(pr_analysis_data)[:500]}..."
+            )
+
+            # Handle JSON string (most common case with Portia)
+            if isinstance(pr_analysis_data, str):
+                debug_log("Input is JSON string, attempting to parse")
+                try:
+                    parsed_result = json.loads(pr_analysis_data)
+                    debug_log(f"Successfully parsed JSON, type: {type(parsed_result)}")
+                    debug_log(
+                        f"Parsed keys: {list(parsed_result.keys()) if isinstance(parsed_result, dict) else 'Not a dict'}"
+                    )
+
+                    if (
+                        isinstance(parsed_result, dict)
+                        and "control_mappings" in parsed_result
+                    ):
+                        mappings = parsed_result["control_mappings"]
+                        debug_log(
+                            f"Found {len(mappings) if mappings else 0} control mappings in parsed JSON"
+                        )
+                        return mappings
+                    else:
+                        debug_log("No control_mappings key found in parsed JSON")
+
+                except json.JSONDecodeError as e:
+                    debug_log(f"Failed to parse JSON: {e}")
+
+            # Handle dictionary
+            if (
+                isinstance(pr_analysis_data, dict)
+                and "control_mappings" in pr_analysis_data
+            ):
+                mappings = pr_analysis_data["control_mappings"]
+                debug_log(
+                    f"Found {len(mappings) if mappings else 0} control mappings in dict"
+                )
+                return mappings
+
+            debug_log("No control mappings found, returning empty list")
+            return []
+
+        debug_log(f"Starting plan build for {repo_name}#{pr_number}")
+        debug_log(f"Debug log file: {debug_log_file}")
+
         builder = (
             PlanBuilderV2(f"Compliance analysis for {repo_name}#{pr_number}")
             .input(name="repo_name", description="The full repo name, e.g. org/repo")
@@ -637,93 +627,30 @@ class ComplianceAgent:
                 step_name="generate_evidence",
                 output_schema=GenerateEvidenceOutput,
             )
-            # Extract components for downstream processing with safer extraction logic
+            # Extract PR analysis data with proper debugging
             .function_step(
-                function=lambda analysis: (
-                    analysis.pr_analysis
-                    if hasattr(analysis, "pr_analysis")
-                    else (
-                        analysis.get("pr_analysis", {})
-                        if isinstance(analysis, dict)
-                        else {}
-                    )
-                ),
-                args={"analysis": StepOutput("analyze_pr")},
+                function=extract_pr_analysis,
+                args={"analysis_result": StepOutput("analyze_pr")},
                 step_name="extract_pr_analysis",
             )
+            # Extract evidence bundle data with proper debugging
             .function_step(
-                function=lambda evidence: (
-                    evidence.evidence_bundle
-                    if hasattr(evidence, "evidence_bundle")
-                    else (
-                        evidence.get("evidence_bundle", {})
-                        if isinstance(evidence, dict)
-                        else {}
-                    )
-                ),
-                args={"evidence": StepOutput("generate_evidence")},
+                function=extract_evidence_bundle,
+                args={"evidence_result": StepOutput("generate_evidence")},
                 step_name="extract_evidence_bundle",
             )
+            # Compute PR ID string
             .function_step(
                 function=lambda repo_name, pr_number: f"{repo_name}#{pr_number}",
                 args={"repo_name": Input("repo_name"), "pr_number": Input("pr_number")},
                 step_name="compute_pr_id",
             )
+            # Extract control mappings from PR analysis
             .function_step(
-                function=lambda pr_analysis: (
-                    pr_analysis.get("control_mappings", [])
-                    if isinstance(pr_analysis, dict)
-                    else (
-                        getattr(pr_analysis, "control_mappings", [])
-                        if hasattr(pr_analysis, "control_mappings")
-                        else []
-                    )
-                ),
-                args={"pr_analysis": StepOutput("extract_pr_analysis")},
+                function=extract_control_mappings,
+                args={"pr_analysis_data": StepOutput("extract_pr_analysis")},
                 step_name="extract_mapped_controls",
             )
-            # Draft evidence text (may raise Clarification for approval gate)
-            .invoke_tool_step(
-                tool="draft_evidence_text",
-                args={
-                    "pr_id": StepOutput("compute_pr_id"),
-                    "repo": Input("repo_name"),
-                    "analysis": StepOutput("extract_pr_analysis"),
-                    "mapped_controls": StepOutput("extract_mapped_controls"),
-                    "policy_refs": Input("policy_refs"),
-                },
-                step_name="draft_evidence",
-                output_schema=DraftEvidenceOutput,
-            )
-            # Risk level for conditional approval branch
-            .function_step(
-                function=lambda pr_analysis: (
-                    pr_analysis.get("risk_level", "low")
-                    if isinstance(pr_analysis, dict)
-                    else (
-                        getattr(pr_analysis, "risk_level", "low")
-                        if hasattr(pr_analysis, "risk_level")
-                        else "low"
-                    )
-                ),
-                args={"pr_analysis": StepOutput("extract_pr_analysis")},
-                step_name="risk_level",
-            )
-            .if_(
-                condition=lambda risk: str(risk).lower() in ("high", "critical"),
-                args={"risk": StepOutput("risk_level")},
-            )
-            .invoke_tool_step(
-                tool="request_human_approval",
-                args={
-                    "pr_analysis": StepOutput("extract_pr_analysis"),
-                    "evidence_bundle": StepOutput("extract_evidence_bundle"),
-                },
-                step_name="approval",
-                output_schema=ApprovalOutput,
-            )
-            .endif()
-            # Persist analysis and evidence to DB
             .invoke_tool_step(
                 tool="persist_results_to_db",
                 args={
@@ -733,105 +660,46 @@ class ComplianceAgent:
                 step_name="persist_results",
                 output_schema=PersistOutput,
             )
-            # Extract components for Slack notification
-            .function_step(
-                function=lambda pr_analysis: (
-                    pr_analysis.get("pr_url")
-                    if isinstance(pr_analysis, dict)
-                    else (
-                        getattr(pr_analysis, "pr_url", None)
-                        if hasattr(pr_analysis, "pr_url")
-                        else None
-                    )
-                ),
-                args={"pr_analysis": StepOutput("extract_pr_analysis")},
-                step_name="extract_pr_url",
+            .llm_step(
+                task="""
+                You are a Compliance Evidence Assistant analyzing a pull request for compliance violations.
+
+                Context:
+                - PR ID: {compute_pr_id}
+                - Repository: {repo_name}
+                - PR Analysis Data: {extract_pr_analysis}
+                - Mapped Controls: {extract_mapped_controls}
+                - Policy Frameworks: {policy_refs}
+
+                For each mapped compliance control, you must generate evidence items that strictly conform to the DraftEvidenceOutput JSON schema.
+
+                For each control, analyze:
+                1. **summary**: How well the control is being met (met/partially met/not met)
+                2. **artifacts**: List specific files, logs, or evidence (e.g., PR files, code changes)
+                3. **risk**: Any residual compliance risks from the PR changes
+                4. **rationale**: Why your assessment is justified based on the code changes
+                5. **confidence**: Float 0-1 indicating your confidence in the assessment
+
+                Important:
+                - Always reference specific files and line numbers in artifacts
+                - Be specific about what the code changes actually do
+
+                Output must be valid DraftEvidenceOutput JSON with:
+                - items: List[EvidenceItem] (one per control)
+                - overall_summary: String summarizing compliance impact
+                - confidence: Float 0-1 for overall confidence
+                """,
+                output_schema=DraftEvidenceOutput,
+                inputs=[
+                    StepOutput("compute_pr_id"),
+                    Input("repo_name"),
+                    StepOutput("extract_pr_analysis"),
+                    StepOutput("extract_mapped_controls"),
+                    Input("policy_refs"),
+                ],
+                step_name="draft_evidence",
             )
-            .function_step(
-                function=lambda drafted: (
-                    drafted.overall_summary
-                    if hasattr(drafted, "overall_summary")
-                    else (
-                        drafted.get("overall_summary", "Analysis completed")
-                        if isinstance(drafted, dict)
-                        else "Analysis completed"
-                    )
-                ),
-                args={"drafted": StepOutput("draft_evidence")},
-                step_name="extract_findings_summary",
-            )
-            .function_step(
-                function=lambda drafted: (
-                    sorted(
-                        {
-                            (item.risk or "").capitalize()
-                            for item in drafted.items
-                            if (item.risk or "")
-                        }
-                    )
-                    if hasattr(drafted, "items") and hasattr(drafted.items, "__iter__")
-                    else (
-                        sorted(
-                            {
-                                (item.get("risk", "") or "").capitalize()
-                                for item in drafted.get("items", [])
-                                if (item.get("risk", "") or "")
-                            }
-                        )
-                        if isinstance(drafted, dict)
-                        else []
-                    )
-                ),
-                args={"drafted": StepOutput("draft_evidence")},
-                step_name="extract_risks",
-            )
-            # Draft Slack message (raises Clarification for send approval)
-            .invoke_tool_step(
-                tool="draft_slack_message",
-                args={
-                    "pr_id": StepOutput("compute_pr_id"),
-                    "repo": Input("repo_name"),
-                    "findings_summary": StepOutput("extract_findings_summary"),
-                    "risks": StepOutput("extract_risks"),
-                    "link": StepOutput("extract_pr_url"),
-                    "demo": Input("demo"),
-                },
-                step_name="draft_slack",
-                output_schema=DraftSlackOutput,
-            )
-            # Assemble final output (removed Slack sending since slack.postMessage tool is not available)
-            .function_step(
-                function=lambda analysis, evidence, drafted, slack: {
-                    "analysis": (
-                        analysis.model_dump()
-                        if hasattr(analysis, "model_dump")
-                        else analysis
-                    ),
-                    "evidence": (
-                        evidence.model_dump()
-                        if hasattr(evidence, "model_dump")
-                        else evidence
-                    ),
-                    "drafted_evidence": (
-                        drafted.model_dump()
-                        if hasattr(drafted, "model_dump")
-                        else drafted
-                    ),
-                    "slack_draft": (
-                        slack.model_dump() if hasattr(slack, "model_dump") else slack
-                    ),
-                    "status": "completed",
-                    "message": "Compliance analysis completed successfully",
-                },
-                args={
-                    "analysis": StepOutput("analyze_pr"),
-                    "evidence": StepOutput("generate_evidence"),
-                    "drafted": StepOutput("draft_evidence"),
-                    "slack": StepOutput("draft_slack"),
-                },
-                step_name="assemble_final",
-            )
-            .final_output(output_schema=FinalOutput)
+            .final_output(output_schema=FinalOutput, summarize=True)
         )
         return builder.build()
 
@@ -870,14 +738,5 @@ class ComplianceAgent:
                 plan=plan, plan_run_inputs=inputs, end_user=end_user
             )
         except Exception as e:
-            logger.error(f"Plan execution failed: {e}", exc_info=True)
+            logger.error(f"Plan execution failed: {e}")
             raise
-
-    def get_agent_stats(self) -> Dict:
-        return {
-            "agent_name": "Compliance Copilot",
-            "version": "1.0.0",
-            "tools_available": 6,
-            "frameworks_supported": ["SOC2", "ISO27001", "GDPR"],
-            "status": "active",
-        }
