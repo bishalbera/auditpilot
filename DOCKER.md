@@ -1,8 +1,8 @@
 # Docker Guide for Compliance Copilot
 
-This guide explains how to run Compliance Copilot using Docker for both development and production environments.
+This guide explains how to run Compliance Copilot using Docker for both development and production environments. For local development without Docker, see the [Local Development Setup](#local-development-setup) section.
 
-## Quick Start
+## Quick Start with Docker
 
 ### Prerequisites
 - Docker and Docker Compose installed on your system

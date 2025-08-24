@@ -11,6 +11,18 @@
 
 Compliance Copilot is an intelligent automation system that analyzes GitHub Pull Requests for compliance risks and automatically generates audit-ready evidence bundles. Built for modern development teams who need to maintain regulatory compliance (SOC 2, ISO 27001, GDPR) without slowing down their development velocity.
 
+## 🎥 Demo Video
+
+[![Compliance Copilot Demo](https://img.youtube.com/vi/dRIXyc8TmPo/0.jpg)](https://www.youtube.com/watch?v=dRIXyc8TmPo)
+
+**[Watch the Demo on YouTube](https://www.youtube.com/watch?v=dRIXyc8TmPo)** 🎬
+
+See Compliance Copilot in action! This demo showcases:
+- Real-time PR analysis and compliance risk detection
+- AI-powered evidence bundle generation
+- Dashboard monitoring and compliance metrics
+- Integration with GitHub webhooks and development workflows
+
 ### ✨ Key Features
 
 - **🔍 Automated PR Analysis** - Real-time scanning of code changes for compliance risks
@@ -56,16 +68,51 @@ Compliance Copilot is an intelligent automation system that analyzes GitHub Pull
 
 ### Installation
 
+#### Option 1: Local Development (Recommended)
+
 1. **Clone the repository**
    ```bash
    git clone https://github.com/yourusername/compliance-copilot.git
    cd compliance-copilot
    ```
 
-2. **Install dependencies**
+2. **Create and activate virtual environment**
    ```bash
+   # Create virtual environment
+   python -m venv venv
+
+   # Activate virtual environment
+   # On macOS/Linux:
+   source venv/bin/activate
+
+   # On Windows:
+   # venv\Scripts\activate
+   ```
+
+3. **Install dependencies**
+   ```bash
+   pip install --upgrade pip
    pip install -r requirements.txt
    ```
+
+#### Option 2: Docker (Production/Isolated Environment)
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/compliance-copilot.git
+   cd compliance-copilot
+   ```
+
+2. **Run with Docker Compose**
+   ```bash
+   # Production mode
+   docker-compose up --build
+
+   # Development mode with live reloading
+   docker-compose up --build  # Uses override automatically
+   ```
+
+   See [DOCKER.md](DOCKER.md) for detailed Docker instructions.
 
 3. **Configure environment**
    ```bash
