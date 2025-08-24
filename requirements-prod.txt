@@ -1,5 +1,5 @@
 # Production requirements with pinned versions for Compliance Copilot
-# Pin versions for reproducible builds in production environments
+# Generated from actual installed versions using pip show
 
 # Web framework
 fastapi==0.116.1

@@ -1,0 +1,46 @@
+# Development override for docker-compose.yml
+# This file is automatically loaded by docker-compose for development
+version: '3.8'
+
+services:
+  compliance-copilot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dependencies  # Stop at dependencies stage for faster rebuilds
+    environment:
+      - DEBUG=true
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      # Mount source code for live reloading
+      - .:/app
+      # Override entrypoint to run with reload
+      - ./docker-entrypoint.sh:/app/docker-entrypoint.sh
+      # Exclude node_modules and __pycache__ from sync
+      - /app/.venv
+      - /app/__pycache__
+      - /app/.pytest_cache
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "python -m uvicorn src.main:app
+             --host 0.0.0.0
+             --port 8000
+             --reload
+             --log-level debug"
+    develop:
+      watch:
+        # Live sync for Python files
+        - action: sync
+          path: ./src
+          target: /app/src
+        - action: sync
+          path: ./templates
+          target: /app/templates
+        - action: sync
+          path: ./static
+          target: /app/static
+        # Rebuild on requirements change
+        - action: rebuild
+          path: ./requirements.txt

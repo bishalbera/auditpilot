@@ -92,11 +92,7 @@ Create a `.env` file with the following variables:
 PORTIA_API_KEY=your_portia_api_key
 GEMINI_API_KEY=your_gemini_api_key
 GITHUB_TOKEN=your_github_token
-
-# Optional Integrations
-SLACK_WEBHOOK_URL=your_slack_webhook
 NOTION_TOKEN=your_notion_token
-JIRA_URL=your_jira_instance
 
 # Webhook Security
 GITHUB_WEBHOOK_SECRET=your_webhook_secret
@@ -132,8 +128,6 @@ curl -X POST "http://localhost:8000/analyze" \
 ### Dashboard Features
 
 - **Live Analysis Feed** - Real-time PR compliance analysis results
-- **Risk Metrics** - Compliance risk trends and statistics
-- **Evidence Bundles** - Download audit-ready documentation
 - **Framework Coverage** - Track compliance across different frameworks
 
 ## 📊 Compliance Frameworks
