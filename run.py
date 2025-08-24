@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Compliance Copilot - Application Startup Script
-Enhanced for AgentHack 2025 Demo
+Enhanced for AgentHack
 """
 
 import os

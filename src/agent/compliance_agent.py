@@ -6,6 +6,7 @@ from portia import (
     Config,
     DefaultToolRegistry,
     InMemoryToolRegistry,
+    McpToolRegistry,
     LLMProvider,
     PlanRun,
     Portia,
@@ -22,6 +23,7 @@ from src.models import PRAnalysis
 from src.config import settings
 from portia import PlanBuilderV2, StepOutput, Input
 from portia.end_user import EndUser
+from src.tools import CustomNotionPageCreatorTool, CreateNotionPageOutput
 
 logger = logging.getLogger(__name__)
 
@@ -433,15 +435,31 @@ class ComplianceAgent:
         default_model="google/gemini-2.0-flash",
         google_api_key=settings.gemini_api_key,
     )
-    tools = DefaultToolRegistry(
-        config=config,
-    ) + InMemoryToolRegistry.from_local_tools(
-        [
-            AnalyzePullRequestTool(),
-            GenerateEvidenceBundleTool(),
-            PersistResultsToDbTool(),
-            CheckApprovalNeededTool(),
-        ]
+
+    # Create Notion MCP tool registry
+    notion_tools = McpToolRegistry.from_stdio_connection(
+        server_name="notionApi",
+        command="npx",
+        args=["-y", "@notionhq/notion-mcp-server"],
+        env={
+            "OPENAPI_MCP_HEADERS": f'{{"Authorization": "Bearer {settings.notion_token}", "Notion-Version": "2022-06-28"}}'
+        },
+    )
+
+    tools = (
+        DefaultToolRegistry(
+            config=config,
+        )
+        + InMemoryToolRegistry.from_local_tools(
+            [
+                AnalyzePullRequestTool(),
+                GenerateEvidenceBundleTool(),
+                PersistResultsToDbTool(),
+                CheckApprovalNeededTool(),
+                CustomNotionPageCreatorTool(),
+            ]
+        )
+        + notion_tools
     )
 
     if not tools.get_tool("portia:slack:bot:send_message"):
@@ -449,6 +467,8 @@ class ComplianceAgent:
             "Slack boy tool not found. Please install on Portia "
             "cloud by going to https://app.portialabs.ai/dashboard/tool-registry"
         )
+    if not tools.get_tool("portia:mcp:mcp.notion.com:notion_create_pages"):
+        raise ValueError("notion tool not available")
 
     portia = Portia(config=config, tools=tools)
 
@@ -476,6 +496,57 @@ class ComplianceAgent:
         except Exception as e:
             logger.error(f"Error extracting risk level: {e}")
             return "LOW"
+
+    def _ensure_pages_list(self, pages_data):
+        """Ensure pages data is a proper list, not a JSON string."""
+        logger.info(f"_ensure_pages_list - Input type: {type(pages_data)}")
+        logger.info(
+            f"_ensure_pages_list - Input content preview: {str(pages_data)[:200]}..."
+        )
+
+        try:
+            # If it's already a list, return it as-is
+            if isinstance(pages_data, list):
+                logger.info(f"Data is already a list with {len(pages_data)} items")
+                return pages_data
+
+            # If it's a string, try to parse it as JSON
+            if isinstance(pages_data, str):
+                logger.info("Data is a string, attempting to parse as JSON")
+                try:
+                    parsed_data = json.loads(pages_data)
+                    if isinstance(parsed_data, list):
+                        logger.info(
+                            f"Successfully parsed JSON string to list with {len(parsed_data)} items"
+                        )
+                        return parsed_data
+                    else:
+                        logger.warning(
+                            f"Parsed JSON is not a list, got: {type(parsed_data)}"
+                        )
+                        # If it's a single object, wrap it in a list
+                        return [parsed_data]
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse pages_data as JSON: {e}")
+                    # Return empty list as fallback
+                    return []
+
+            # If it's some other type, try to convert to list
+            logger.warning(
+                f"Unexpected pages_data type: {type(pages_data)}, attempting to convert to list"
+            )
+            if hasattr(pages_data, "__iter__") and not isinstance(
+                pages_data, (str, bytes)
+            ):
+                return list(pages_data)
+            else:
+                # Wrap single item in list
+                return [pages_data]
+
+        except Exception as e:
+            logger.error(f"Error in _ensure_pages_list: {e}")
+            # Return empty list as ultimate fallback
+            return []
 
     def build_text_plan(
         self,
@@ -658,19 +729,288 @@ class ComplianceAgent:
 
         def create_evidence_summary(evidence_bundle_data):
             """Create a concise summary of evidence for approval requests."""
+            debug_log(
+                f"create_evidence_summary - Input type: {type(evidence_bundle_data)}"
+            )
+            debug_log(
+                f"create_evidence_summary - Input keys: {list(evidence_bundle_data.keys()) if isinstance(evidence_bundle_data, dict) else 'Not a dict'}"
+            )
+
             if not isinstance(evidence_bundle_data, dict):
+                debug_log("Input is not a dictionary, returning default message")
                 return "Evidence bundle generated with compliance analysis."
 
+            # Try to extract executive summary directly from the data
             summary = evidence_bundle_data.get("executive_summary", "")
+            debug_log(f"Found executive_summary: {bool(summary)}")
             if summary:
-                return summary[:300] + "..." if len(summary) > 300 else summary
+                # Clean up the summary text - remove markdown headers and extra formatting
+                cleaned_summary = (
+                    summary.replace("\n# ", " ")
+                    .replace("\n## ", " ")
+                    .replace("\n", " ")
+                )
+                cleaned_summary = cleaned_summary.strip()
+                result = (
+                    cleaned_summary[:300] + "..."
+                    if len(cleaned_summary) > 300
+                    else cleaned_summary
+                )
+                debug_log(f"Returning executive summary (length: {len(result)})")
+                return result
 
-            # Fallback to other fields
+            # Fallback to technical details
             technical = evidence_bundle_data.get("technical_details", "")
+            debug_log(f"Found technical_details: {bool(technical)}")
             if technical:
-                return technical[:300] + "..." if len(technical) > 300 else technical
+                # Clean up technical details - remove markdown and extract key info
+                cleaned_technical = (
+                    technical.replace("\n# ", " ")
+                    .replace("\n## ", " ")
+                    .replace("\n", " ")
+                )
+                cleaned_technical = cleaned_technical.strip()
+                result = (
+                    cleaned_technical[:300] + "..."
+                    if len(cleaned_technical) > 300
+                    else cleaned_technical
+                )
+                debug_log(f"Returning technical details (length: {len(result)})")
+                return result
 
-            return "Evidence bundle contains compliance analysis and control mappings."
+            # Try to extract PR analysis info as fallback
+            pr_analysis = evidence_bundle_data.get("pr_analysis", {})
+            if isinstance(pr_analysis, dict):
+                title = pr_analysis.get("title", "")
+                risk_level = pr_analysis.get("risk_level", "")
+                files_changed = pr_analysis.get("files_changed", [])
+                if title or risk_level:
+                    result = f"PR '{title}' - Risk: {risk_level.upper() if risk_level else 'Unknown'}, Files: {len(files_changed) if isinstance(files_changed, list) else 0}"
+                    debug_log(f"Returning PR analysis summary: {result}")
+                    return result
+
+        def create_notion_page_data(
+            pr_id, evidence_bundle, risk_level, pr_analysis, control_mappings
+        ):
+            """Create Notion page data with proper data extraction and return as a plain list."""
+            debug_log(
+                f"create_notion_page_data - evidence_bundle type: {type(evidence_bundle)}"
+            )
+            debug_log(
+                f"create_notion_page_data - pr_analysis type: {type(pr_analysis)}"
+            )
+            debug_log(
+                f"create_notion_page_data - control_mappings type: {type(control_mappings)}"
+            )
+
+            # Helper function to safely parse JSON strings
+            def safe_parse_json(data, fallback=None):
+                if isinstance(data, str):
+                    try:
+                        parsed = json.loads(data)
+                        debug_log(
+                            f"Successfully parsed JSON data of type: {type(parsed)}"
+                        )
+                        return parsed
+                    except json.JSONDecodeError as e:
+                        debug_log(f"Failed to parse JSON: {e}")
+                        return fallback or {}
+                elif isinstance(data, dict):
+                    return data
+                else:
+                    debug_log(f"Unexpected data type: {type(data)}, returning fallback")
+                    return fallback or {}
+
+            # Safe extraction helper
+            def safe_get(data, key, default="Not available"):
+                if isinstance(data, dict):
+                    return data.get(key, default)
+                return default
+
+            # Parse all input parameters
+            evidence_bundle_dict = safe_parse_json(evidence_bundle, {})
+            pr_analysis_dict = safe_parse_json(pr_analysis, {})
+            control_mappings_list = safe_parse_json(control_mappings, [])
+
+            debug_log(
+                f"Parsed evidence_bundle keys: {list(evidence_bundle_dict.keys()) if isinstance(evidence_bundle_dict, dict) else 'Not a dict'}"
+            )
+            debug_log(
+                f"Parsed pr_analysis keys: {list(pr_analysis_dict.keys()) if isinstance(pr_analysis_dict, dict) else 'Not a dict'}"
+            )
+            debug_log(
+                f"Parsed control_mappings length: {len(control_mappings_list) if isinstance(control_mappings_list, list) else 'Not a list'}"
+            )
+
+            # Extract data safely from the evidence bundle
+            executive_summary = safe_get(
+                evidence_bundle_dict,
+                "executive_summary",
+                "Analysis completed successfully",
+            )
+            technical_details = safe_get(
+                evidence_bundle_dict,
+                "technical_details",
+                "Technical analysis completed",
+            )
+            control_impact = safe_get(
+                evidence_bundle_dict,
+                "control_impact_assessment",
+                "Control impact assessed",
+            )
+            risk_mitigation = safe_get(
+                evidence_bundle_dict,
+                "risk_mitigation_plan",
+                "Risk mitigation plan prepared",
+            )
+            audit_trail = safe_get(evidence_bundle_dict, "audit_trail", [])
+
+            # Extract PR analysis data safely
+            pr_title = safe_get(pr_analysis_dict, "title", "Unknown PR")
+            pr_url = safe_get(pr_analysis_dict, "pr_url", "#")
+            pr_author = safe_get(pr_analysis_dict, "author", "Unknown")
+            files_changed = safe_get(pr_analysis_dict, "files_changed", [])
+            files_count = (
+                len(files_changed) if isinstance(files_changed, list) else "N/A"
+            )
+            additions = safe_get(pr_analysis_dict, "additions", 0)
+            deletions = safe_get(pr_analysis_dict, "deletions", 0)
+            risk_score = safe_get(pr_analysis_dict, "risk_score", 0.0)
+
+            # Extract control mappings data safely
+            control_count = (
+                len(control_mappings_list)
+                if isinstance(control_mappings_list, list)
+                else 0
+            )
+
+            # Generate control list
+            if isinstance(control_mappings_list, list) and control_mappings_list:
+                control_items = []
+                for control_mapping in control_mappings_list:
+                    if isinstance(control_mapping, dict):
+                        control_info = control_mapping.get("control", {})
+                        if isinstance(control_info, dict):
+                            control_id = control_info.get("control_id", "Unknown")
+                            control_title = control_info.get("title", "No title")
+                            framework = control_info.get("framework", "Unknown")
+                            confidence = control_mapping.get("confidence", 0)
+                            control_items.append(
+                                f"- **{framework} {control_id}**: {control_title} (Confidence: {confidence:.0%})"
+                            )
+                control_list = (
+                    "\n".join(control_items)
+                    if control_items
+                    else "No control mappings found."
+                )
+            else:
+                control_list = "No control mappings found."
+
+            debug_log(
+                f"Generated control_list with {len(control_list.split(chr(10)))} items"
+            )
+
+            # Format audit trail as JSON (handle both list and string cases)
+            if isinstance(audit_trail, list):
+                audit_trail_json = (
+                    json.dumps(audit_trail, indent=2) if audit_trail else "[]"
+                )
+            elif isinstance(audit_trail, str):
+                # It might already be a JSON string
+                try:
+                    # Try to parse and re-format
+                    parsed_trail = json.loads(audit_trail)
+                    audit_trail_json = json.dumps(parsed_trail, indent=2)
+                except json.JSONDecodeError:
+                    audit_trail_json = audit_trail  # Use as-is if not valid JSON
+            else:
+                audit_trail_json = "[]"
+
+            # Clean up text content for Notion (remove excessive markdown formatting)
+            def clean_text(text):
+                if not isinstance(text, str):
+                    return str(text)
+                # Remove excessive markdown headers and clean up formatting
+                cleaned = (
+                    text.replace("\n# ", "\n## ")
+                    .replace("\n## ", "\n**")
+                    .replace("**\n", "**\n\n")
+                )
+                # Remove multiple consecutive newlines
+                import re
+
+                cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+                return cleaned.strip()
+
+            executive_summary_clean = clean_text(executive_summary)
+            technical_details_clean = clean_text(technical_details)
+            control_impact_clean = clean_text(control_impact)
+            risk_mitigation_clean = clean_text(risk_mitigation)
+
+            # Create the page data structure - NOTE: Return raw list, not JSON string
+            page_data = {
+                "properties": {"title": f"🛡️ Compliance Analysis: {pr_id}"},
+                "content": f"""# 🛡️ Compliance Analysis Report
+
+**PR ID**: [{pr_id}]({pr_url})
+**Title**: {pr_title}
+**Author**: {pr_author}
+**Risk Level**: {risk_level.upper()}
+**Risk Score**: {risk_score:.2f}/1.0
+**Analysis Date**: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## 📊 Change Summary
+
+**Files Changed**: {files_count}
+**Lines Added**: {additions}
+**Lines Deleted**: {deletions}
+**Control Mappings**: {control_count}
+
+## 📋 Executive Summary
+
+{executive_summary_clean}
+
+## ⚠️ Risk Assessment
+
+> **Risk Level**: {risk_level.upper()}
+>
+> **Overall Risk Score**: {risk_score:.2f}/1.0
+
+## 🎯 Compliance Controls
+
+{control_list}
+
+## 🔧 Technical Analysis
+
+{technical_details_clean}
+
+## 🏗️ Control Impact Assessment
+
+{control_impact_clean}
+
+## 🛠️ Risk Mitigation Plan
+
+{risk_mitigation_clean}
+
+## 📝 Audit Trail
+
+```json
+{audit_trail_json}
+```
+
+---
+*Generated by Compliance Copilot - Automated compliance analysis for development workflows*""",
+            }
+
+            # CRITICAL: Return the list directly, don't JSON serialize it
+            # The function step should return the actual Python list object
+            result = [page_data]
+            debug_log(f"Returning raw Python list with {len(result)} pages")
+            debug_log(
+                f"Result type: {type(result)}, first item type: {type(result[0])}"
+            )
+
+            return result
 
         debug_log(f"Starting plan build for {repo_name}#{pr_number}")
         debug_log(f"Debug log file: {debug_log_file}")
@@ -793,16 +1133,34 @@ class ComplianceAgent:
                 step_name="check_approval_needed",
                 output_schema=ApprovalNeededOutput,
             )
-            # Step 8: Send notification for medium/high risk PRs
+            # Step 8: Create Notion page data and then create the page using custom tool
+            .function_step(
+                function=create_notion_page_data,
+                args={
+                    "pr_id": StepOutput("compute_pr_id"),
+                    "evidence_bundle": StepOutput("extract_evidence_bundle"),
+                    "risk_level": StepOutput("extract_risk_level"),
+                    "pr_analysis": StepOutput("extract_pr_analysis"),
+                    "control_mappings": StepOutput("extract_mapped_controls"),
+                },
+                step_name="prepare_notion_page_data",
+            )
+            .invoke_tool_step(
+                tool="custom_notion_page_creator",
+                args={"pages": StepOutput("prepare_notion_page_data")},
+                step_name="create_notion_page",
+                output_schema=CreateNotionPageOutput,
+            )
+            # Step 9: Send notification for medium/high risk PRs
             .invoke_tool_step(
                 tool="portia:slack:bot:send_message",
                 args={
                     "target_id": "general",
-                    "message": f"🚨 Compliance Analysis Complete - {StepOutput('compute_pr_id')} (Risk: {StepOutput('extract_risk_level')}). Review required for medium/high risk.",
+                    "message": f"🚨 Compliance Analysis Complete - {StepOutput('compute_pr_id')} (Risk: {StepOutput('extract_risk_level')}). Notion documentation created. Review required for medium/high risk.",
                 },
                 step_name="send_slack_notification",
             )
-            # Step 9: Create evidence summary for approval
+            # Step 10: Create evidence summary for approval
             .function_step(
                 function=create_evidence_summary,
                 args={"evidence_bundle_data": StepOutput("extract_evidence_bundle")},

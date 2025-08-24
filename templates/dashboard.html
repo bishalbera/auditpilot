@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Compliance Copilot Dashboard</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -83,9 +82,7 @@
         }
 
         .main-content {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 30px;
+            display: block;
         }
 
         .analysis-panel, .demo-panel {
@@ -230,41 +227,14 @@
                 </div>
             </div>
 
-            <div class="demo-panel">
-                <h2 class="panel-title">🚀 Demo Controls</h2>
-                <p>Trigger demo scenarios to showcase compliance analysis capabilities:</p>
-
-                <div class="demo-buttons">
-                    <button class="btn" onclick="triggerDemo('auth_changes')">
-                        🔐 Authentication Changes
-                    </button>
-                    <button class="btn" onclick="triggerDemo('data_access')">
-                        🗄️ Data Access Changes
-                    </button>
-                    <button class="btn" onclick="triggerDemo('encryption')">
-                        🔒 Encryption Updates
-                    </button>
-                </div>
-
-                <div class="loading" id="demoLoading">
-                    Processing demo scenario...
-                </div>
-
-                <div class="chart-container">
-                    <canvas id="riskChart"></canvas>
-                </div>
-            </div>
         </div>
     </div>
 
     <script>
-        let riskChart;
-
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
             loadStats();
             loadRecentAnalyses();
-            initializeChart();
 
             // Refresh data every 30 seconds
             setInterval(() => {
@@ -286,8 +256,6 @@
                 document.getElementById('highRiskPRs').textContent = highRiskCount;
                 document.getElementById('controlsMapped').textContent = totalControls;
                 document.getElementById('evidenceBundles').textContent = analyses.length;
-
-                updateRiskChart(analyses);
             } catch (error) {
                 console.error('Failed to load stats:', error);
             }
@@ -320,7 +288,15 @@
             div.className = 'analysis-item fade-in';
 
             const riskClass = `risk-${analysis.risk_level.toLowerCase()}`;
-            const timeAgo = new Date(analysis.created_at).toLocaleString();
+            const timeAgo = new Date(analysis.created_at).toLocaleString('en-IN', {
+                timeZone: 'Asia/Kolkata',
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true
+            });
 
             div.innerHTML = `
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
@@ -338,7 +314,6 @@
                         <span style="font-size: 0.8em; color: #666;">${analysis.control_count} controls</span>
                     </div>
                     <div style="display: flex; gap: 10px; align-items: center;">
-                        <a href="/analysis/${encodeURIComponent(analysis.pr_id)}" class="btn" style="padding: 6px 12px; font-size: 0.85em;">View JSON</a>
                         <span style="font-size: 0.8em; color: #999;">${timeAgo}</span>
                     </div>
                 </div>
@@ -347,124 +322,6 @@
             return div;
         }
 
-        async function triggerDemo(scenario) {
-            const loading = document.getElementById('demoLoading');
-            loading.classList.add('show');
-
-            try {
-                const response = await fetch('/demo/trigger', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ scenario })
-                });
-
-                const result = await response.json();
-
-                if (response.ok) {
-                    // Show success message
-                    showNotification(`Demo triggered: ${result.description}`, 'success');
-
-                    // Refresh data after a short delay
-                    setTimeout(() => {
-                        loadStats();
-                        loadRecentAnalyses();
-                    }, 3000);
-                } else {
-                    showNotification(`Demo failed: ${result.detail}`, 'error');
-                }
-
-            } catch (error) {
-                console.error('Demo trigger failed:', error);
-                showNotification('Demo trigger failed', 'error');
-            } finally {
-                loading.classList.remove('show');
-            }
-        }
-
-        function showNotification(message, type) {
-            const notification = document.createElement('div');
-            notification.style.cssText = `
-                position: fixed;
-                top: 20px;
-                right: 20px;
-                padding: 15px 20px;
-                border-radius: 8px;
-                color: white;
-                font-weight: 600;
-                z-index: 1000;
-                animation: fadeIn 0.3s ease;
-                background: ${type === 'success' ? '#48bb78' : '#f56565'};
-            `;
-            notification.textContent = message;
-
-            document.body.appendChild(notification);
-
-            setTimeout(() => {
-                notification.remove();
-            }, 4000);
-        }
-
-        function initializeChart() {
-            const ctx = document.getElementById('riskChart').getContext('2d');
-
-            riskChart = new Chart(ctx, {
-                type: 'doughnut',
-                data: {
-                    labels: ['Low Risk', 'Medium Risk', 'High Risk', 'Critical Risk'],
-                    datasets: [{
-                        data: [0, 0, 0, 0],
-                        backgroundColor: [
-                            '#48bb78',
-                            '#ed8936',
-                            '#f56565',
-                            '#e53e3e'
-                        ],
-                        borderWidth: 0
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            position: 'bottom',
-                            labels: {
-                                padding: 20,
-                                usePointStyle: true
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        function updateRiskChart(analyses) {
-            if (!riskChart) return;
-
-            const riskCounts = {
-                'LOW': 0,
-                'MEDIUM': 0,
-                'HIGH': 0,
-                'CRITICAL': 0
-            };
-
-            analyses.forEach(analysis => {
-                if (riskCounts.hasOwnProperty(analysis.risk_level)) {
-                    riskCounts[analysis.risk_level]++;
-                }
-            });
-
-            riskChart.data.datasets[0].data = [
-                riskCounts.LOW,
-                riskCounts.MEDIUM,
-                riskCounts.HIGH,
-                riskCounts.CRITICAL
-            ];
-
-            riskChart.update();
-        }
 
         // Add some periodic visual updates for demo purposes
         setInterval(() => {
