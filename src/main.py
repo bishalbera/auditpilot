@@ -11,7 +11,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
-from portia import PlanRunState, MultipleChoiceClarification
 
 from .config import settings
 from .models import get_session, PRAnalysisDB, EvidenceBundleDB
@@ -87,17 +86,11 @@ async def execute_compliance_analysis(
     demo: bool = False,
 ):
     """
-    Execute the Portia-based compliance analysis with clarification handling.
-
-    Args:
-        repo_name: Repository name (e.g., "org/repo")
-        pr_number: Pull request number
-        policy_refs: List of policy frameworks (SOC2, ISO27001, etc.)
-        demo: Whether this is demo/test mode
+    Execute the  compliance analysis with proper clarification handling.
     """
     try:
         logger.info(f"🚀 Starting compliance analysis for {repo_name}#{pr_number}")
-        logger.info("⚙️ Using structured plan execution with human-in-the-loop")
+        logger.info("⚙️ Using structured plan execution")
 
         plan_result = await compliance_agent.run_plan(
             repo_name=repo_name,
@@ -106,35 +99,8 @@ async def execute_compliance_analysis(
             demo=demo,
         )
 
-        # Handle clarifications if the plan is paused
-        while plan_result.state == PlanRunState.NEED_CLARIFICATION:
-            logger.info(f"🔄 Plan paused for clarification: {repo_name}#{pr_number}")
-
-            # Log outstanding clarifications
-            clarifications = plan_result.get_outstanding_clarifications()
-            for clarification in clarifications:
-                # logger.info(f"📋 Clarification required: {clarification.user_guidance[:200]}...")
-
-                logger.info(f"{clarification.user_guidance}")
-                user_input = input(
-                    "please enter a value:\n"
-                    + (
-                        ("\n".join(clarification.options) + "\n")
-                        if isinstance(clarification, MultipleChoiceClarification)
-                        else ""
-                    )
-                )
-
-            plan_result = compliance_agent.portia.resolve_clarification(
-                clarification=clarification, response=user_input, plan_run=plan_result
-            )
-
-            # Continue plan execution
-            plan_result = await compliance_agent.portia.aresume(
-                plan_run_id=plan_result.id
-            )
-
         logger.info(f"✅ Compliance analysis completed for {repo_name}#{pr_number}")
+        logger.info(f"Final plan state: {plan_result.state}")
 
         # Extract and log results
         await log_analysis_results(plan_result, repo_name, pr_number)

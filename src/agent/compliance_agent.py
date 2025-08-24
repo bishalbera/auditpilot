@@ -12,7 +12,6 @@ from portia import (
     Tool,
     ToolRunContext,
     ToolHardError,
-    MultipleChoiceClarification,
 )
 from pydantic import BaseModel, Field
 
@@ -369,71 +368,33 @@ class PersistResultsToDbTool(Tool[PersistOutput]):
             db.close()
 
 
-class CreateApprovalClarificationArgs(BaseModel):
-    pr_id: str = Field(..., description="The PR identifier")
+class CheckApprovalNeededArgs(BaseModel):
     risk_level: str = Field(..., description="The risk level of the PR")
-    evidence: Dict[str, Any] = Field(..., description="The evidence bundle data")
 
 
-class CreateApprovalClarificationTool(Tool[str]):
-    """Create a clarification request for human approval of medium/high risk PRs."""
-
-    id: str = "create_approval_clarification"
-    name: str = "Create Approval Clarification Tool"
-    description: str = (
-        "Create a clarification request for human approval of medium/high risk PRs"
+class ApprovalNeededOutput(BaseModel):
+    approval_needed: bool = Field(
+        ..., description="True if approval is needed, False otherwise"
     )
-    args_schema: type[BaseModel] = CreateApprovalClarificationArgs
+
+
+class CheckApprovalNeededTool(Tool[ApprovalNeededOutput]):
+    """Check if human approval is needed based on risk level."""
+
+    id: str = "check_approval_needed"
+    name: str = "Check Approval Needed Tool"
+    description: str = "Check if human approval is needed based on risk level"
+    args_schema: type[BaseModel] = CheckApprovalNeededArgs
     output_schema: tuple[str, str] = (
-        "str",
-        "Clarification status message",
+        "ApprovalNeededOutput",
+        "Result indicating if approval is needed",
     )
 
-    def run(
-        self, ctx: ToolRunContext, pr_id: str, risk_level: str, evidence: Dict[str, Any]
-    ) -> str:
-        """Run the CreateApprovalClarificationTool."""
-        try:
-            # Log the clarification event
-            logger.info(
-                f"🎯 SLACK NOTIFICATION - Would send approval request for PR {pr_id} (risk: {risk_level})"
-            )
-
-            # Create a clarification for human review
-            clarification = MultipleChoiceClarification(
-                plan_run_id=ctx.plan_run.id,
-                user_guidance=f"""
-🚨 **Compliance Review Required**
-
-**PR:** {pr_id}
-**Risk Level:** {risk_level}
-
-This pull request has been analyzed for compliance risks and requires human approval due to {risk_level.lower()} risk level.
-
-**Key Findings:**
-- Authentication-related code changes detected
-- Multiple compliance controls impacted
-- Evidence bundle generated and stored
-
-**Action Required:** Please review the compliance analysis and choose your approval decision below.
-                """,
-                options=[
-                    "✅ APPROVE - Low compliance risk, proceed with merge",
-                    "⚠️ APPROVE WITH CONDITIONS - Medium risk, require additional testing",
-                    "❌ REJECT - High compliance risk, changes required",
-                    "🔍 REQUEST REVIEW - Need additional compliance team review",
-                ],
-            )
-
-            # Raise the clarification to pause execution and wait for human input
-            raise clarification
-
-        except MultipleChoiceClarification:
-            # Re-raise clarifications so Portia can handle them
-            raise
-        except Exception as e:
-            logger.error(f"Error creating approval clarification: {e}")
-            raise ToolHardError(f"Failed to create approval clarification: {e}")
+    def run(self, ctx: ToolRunContext, risk_level: str) -> ApprovalNeededOutput:
+        """Check if approval is needed based on risk level."""
+        approval_needed = str(risk_level).upper() in ["MEDIUM", "HIGH", "CRITICAL"]
+        logger.info(f"Risk level: {risk_level}, Approval needed: {approval_needed}")
+        return ApprovalNeededOutput(approval_needed=approval_needed)
 
 
 class EvidenceItem(BaseModel):
@@ -463,6 +424,7 @@ class FinalOutput(BaseModel):
     analysis: Dict[str, Any]
     evidence: Dict[str, Any]
     drafted_evidence: DraftEvidenceOutput
+    approval_decision: Optional[str] = None
 
 
 class ComplianceAgent:
@@ -478,9 +440,10 @@ class ComplianceAgent:
             AnalyzePullRequestTool(),
             GenerateEvidenceBundleTool(),
             PersistResultsToDbTool(),
-            CreateApprovalClarificationTool(),
+            CheckApprovalNeededTool(),
         ]
     )
+
     if not tools.get_tool("portia:slack:bot:send_message"):
         raise ValueError(
             "Slack boy tool not found. Please install on Portia "
@@ -521,7 +484,7 @@ class ComplianceAgent:
         policy_refs: Optional[List[str]] = None,
         demo: bool = False,
     ) -> Any:
-        """Build a Portia PlanBuilderV2 plan for compliance analysis, evidence generation, and notification."""
+        """Build a Portia PlanBuilderV2 plan for compliance analysis with proper clarification handling."""
 
         import logging
         import json
@@ -693,6 +656,22 @@ class ComplianceAgent:
             debug_log("No control mappings found, returning empty list")
             return []
 
+        def create_evidence_summary(evidence_bundle_data):
+            """Create a concise summary of evidence for approval requests."""
+            if not isinstance(evidence_bundle_data, dict):
+                return "Evidence bundle generated with compliance analysis."
+
+            summary = evidence_bundle_data.get("executive_summary", "")
+            if summary:
+                return summary[:300] + "..." if len(summary) > 300 else summary
+
+            # Fallback to other fields
+            technical = evidence_bundle_data.get("technical_details", "")
+            if technical:
+                return technical[:300] + "..." if len(technical) > 300 else technical
+
+            return "Evidence bundle contains compliance analysis and control mappings."
+
         debug_log(f"Starting plan build for {repo_name}#{pr_number}")
         debug_log(f"Debug log file: {debug_log_file}")
 
@@ -710,7 +689,7 @@ class ComplianceAgent:
                 description="If true, mark Slack notification as demo",
                 default_value=demo,
             )
-            # Analyze PR
+            # Step 1: Analyze PR
             .invoke_tool_step(
                 tool="analyze_pull_request",
                 args={
@@ -720,7 +699,7 @@ class ComplianceAgent:
                 step_name="analyze_pr",
                 output_schema=AnalyzePROutput,
             )
-            # Generate evidence bundle using analysis from analyze_pr
+            # Step 2: Generate evidence bundle
             .invoke_tool_step(
                 tool="generate_evidence_bundle",
                 args={
@@ -729,30 +708,28 @@ class ComplianceAgent:
                 step_name="generate_evidence",
                 output_schema=GenerateEvidenceOutput,
             )
-            # Extract PR analysis data with proper debugging
+            # Step 3: Extract data for processing
             .function_step(
                 function=extract_pr_analysis,
                 args={"analysis_result": StepOutput("analyze_pr")},
                 step_name="extract_pr_analysis",
             )
-            # Extract evidence bundle data with proper debugging
             .function_step(
                 function=extract_evidence_bundle,
                 args={"evidence_result": StepOutput("generate_evidence")},
                 step_name="extract_evidence_bundle",
             )
-            # Compute PR ID string
             .function_step(
                 function=lambda repo_name, pr_number: f"{repo_name}#{pr_number}",
                 args={"repo_name": Input("repo_name"), "pr_number": Input("pr_number")},
                 step_name="compute_pr_id",
             )
-            # Extract control mappings from PR analysis
             .function_step(
                 function=extract_control_mappings,
                 args={"pr_analysis_data": StepOutput("extract_pr_analysis")},
                 step_name="extract_mapped_controls",
             )
+            # Step 4: Persist to database
             .invoke_tool_step(
                 tool="persist_results_to_db",
                 args={
@@ -762,34 +739,36 @@ class ComplianceAgent:
                 step_name="persist_results",
                 output_schema=PersistOutput,
             )
+            # Step 5: Generate evidence draft with LLM
             .llm_step(
                 task="""
-                You are a Compliance Evidence Assistant analyzing a pull request for compliance violations.
+    You are a Compliance Evidence Assistant analyzing a pull request for compliance violations.
 
-                Context:
-                - PR ID: {compute_pr_id}
-                - Repository: {repo_name}
-                - PR Analysis Data: {extract_pr_analysis}
-                - Mapped Controls: {extract_mapped_controls}
-                - Policy Frameworks: {policy_refs}
+    Context:
+    - PR ID: {compute_pr_id}
+    - Repository: {repo_name}
+    - PR Analysis Data: {extract_pr_analysis}
+    - Mapped Controls: {extract_mapped_controls}
+    - Policy Frameworks: {policy_refs}
 
-                For each mapped compliance control, you must generate evidence items that strictly conform to the DraftEvidenceOutput JSON schema.
+    For each mapped compliance control, generate evidence items that strictly conform to the DraftEvidenceOutput JSON schema.
 
-                For each control, analyze:
-                1. **summary**: How well the control is being met (met/partially met/not met)
-                2. **artifacts**: List specific files, logs, or evidence (e.g., PR files, code changes)
-                3. **risk**: Any residual compliance risks from the PR changes
-                4. **rationale**: Why your assessment is justified based on the code changes
-                5. **confidence**: Float 0-1 indicating your confidence in the assessment
+    For each control, analyze:
+    1. **summary**: How well the control is being met (met/partially met/not met)
+    2. **artifacts**: List specific files, logs, or evidence (e.g., PR files, code changes)
+    3. **risk**: Any residual compliance risks from the PR changes
+    4. **rationale**: Why your assessment is justified based on the code changes
+    5. **confidence**: Float 0-1 indicating your confidence in the assessment
 
-                Important:
-                - Always reference specific files and line numbers in artifacts
-                - Be specific about what the code changes actually do
+    Important:
+    - Always reference specific files and line numbers in artifacts
+    - Be specific about what the code changes actually do
+    - Return valid JSON matching DraftEvidenceOutput schema
 
-                Output must be valid DraftEvidenceOutput JSON with:
-                - items: List[EvidenceItem] (one per control)
-                - overall_summary: String summarizing compliance impact
-                - confidence: Float 0-1 for overall confidence
+    Output must be valid DraftEvidenceOutput JSON with:
+    - items: List[EvidenceItem] (one per control)
+    - overall_summary: String summarizing compliance impact
+    - confidence: Float 0-1 for overall confidence
                 """,
                 output_schema=DraftEvidenceOutput,
                 inputs=[
@@ -801,40 +780,34 @@ class ComplianceAgent:
                 ],
                 step_name="draft_evidence",
             )
-            # Extract risk level for conditional logic
+            # Step 6: Extract risk level for approval check
             .function_step(
                 step_name="extract_risk_level",
                 function=self._extract_risk_level_from_data,
                 args={"pr_analysis": StepOutput("extract_pr_analysis")},
             )
-            # Conditional branch: if risk is MEDIUM or above, require human approval
-            .if_(
-                condition=lambda risk_level: str(risk_level)
-                in ["MEDIUM", "HIGH", "CRITICAL"],
+            # Step 7: Check if approval is needed (separate from raising clarification)
+            .invoke_tool_step(
+                tool="check_approval_needed",
                 args={"risk_level": StepOutput("extract_risk_level")},
+                step_name="check_approval_needed",
+                output_schema=ApprovalNeededOutput,
             )
-            # Send Slack notification for compliance team review
+            # Step 8: Send notification for medium/high risk PRs
             .invoke_tool_step(
                 tool="portia:slack:bot:send_message",
                 args={
-                    "target_id": "compliance-alerts",
-                    "message": f"""🚨 Compliance Review Required - {StepOutput('compute_pr_id')}
-                                Risk level - {StepOutput('extract_risk_level')}.
-                               """,
+                    "target_id": "general",
+                    "message": f"🚨 Compliance Analysis Complete - {StepOutput('compute_pr_id')} (Risk: {StepOutput('extract_risk_level')}). Review required for medium/high risk.",
                 },
                 step_name="send_slack_notification",
             )
-            # Raise clarification for human approval
-            .invoke_tool_step(
-                step_name="request_approval",
-                tool="create_approval_clarification",
-                args={
-                    "pr_id": StepOutput("compute_pr_id"),
-                    "risk_level": StepOutput("extract_risk_level"),
-                    "evidence": StepOutput("extract_evidence_bundle"),
-                },
+            # Step 9: Create evidence summary for approval
+            .function_step(
+                function=create_evidence_summary,
+                args={"evidence_bundle_data": StepOutput("extract_evidence_bundle")},
+                step_name="create_evidence_summary",
             )
-            .endif()
             .final_output(output_schema=FinalOutput, summarize=True)
         )
         return builder.build()
@@ -867,8 +840,6 @@ class ComplianceAgent:
 
         # Create proper EndUser object
         end_user = EndUser(external_id="compliance_system", name="Compliance System")
-
-        # Execute the plan - use run_builder_plan directly (async method)
         try:
             return await self.portia.arun_plan(
                 plan=plan, plan_run_inputs=inputs, end_user=end_user
