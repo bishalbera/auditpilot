@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     gemini_api_key: str
 
     # Portia configuration
-    portia_api_key: Optional[str] = None
+    portia_api_key: str
     portia_base_url: str = "https://api.portialabs.ai"
 
     # Slack integration

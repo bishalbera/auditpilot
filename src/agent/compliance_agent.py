@@ -4,12 +4,15 @@ from typing import Any, Dict, List, Optional
 
 from portia import (
     Config,
+    DefaultToolRegistry,
+    InMemoryToolRegistry,
     LLMProvider,
+    PlanRun,
     Portia,
     Tool,
-    ToolRegistry,
     ToolRunContext,
     ToolHardError,
+    MultipleChoiceClarification,
 )
 from pydantic import BaseModel, Field
 
@@ -366,6 +369,73 @@ class PersistResultsToDbTool(Tool[PersistOutput]):
             db.close()
 
 
+class CreateApprovalClarificationArgs(BaseModel):
+    pr_id: str = Field(..., description="The PR identifier")
+    risk_level: str = Field(..., description="The risk level of the PR")
+    evidence: Dict[str, Any] = Field(..., description="The evidence bundle data")
+
+
+class CreateApprovalClarificationTool(Tool[str]):
+    """Create a clarification request for human approval of medium/high risk PRs."""
+
+    id: str = "create_approval_clarification"
+    name: str = "Create Approval Clarification Tool"
+    description: str = (
+        "Create a clarification request for human approval of medium/high risk PRs"
+    )
+    args_schema: type[BaseModel] = CreateApprovalClarificationArgs
+    output_schema: tuple[str, str] = (
+        "str",
+        "Clarification status message",
+    )
+
+    def run(
+        self, ctx: ToolRunContext, pr_id: str, risk_level: str, evidence: Dict[str, Any]
+    ) -> str:
+        """Run the CreateApprovalClarificationTool."""
+        try:
+            # Log the clarification event
+            logger.info(
+                f"🎯 SLACK NOTIFICATION - Would send approval request for PR {pr_id} (risk: {risk_level})"
+            )
+
+            # Create a clarification for human review
+            clarification = MultipleChoiceClarification(
+                plan_run_id=ctx.plan_run.id,
+                user_guidance=f"""
+🚨 **Compliance Review Required**
+
+**PR:** {pr_id}
+**Risk Level:** {risk_level}
+
+This pull request has been analyzed for compliance risks and requires human approval due to {risk_level.lower()} risk level.
+
+**Key Findings:**
+- Authentication-related code changes detected
+- Multiple compliance controls impacted
+- Evidence bundle generated and stored
+
+**Action Required:** Please review the compliance analysis and choose your approval decision below.
+                """,
+                options=[
+                    "✅ APPROVE - Low compliance risk, proceed with merge",
+                    "⚠️ APPROVE WITH CONDITIONS - Medium risk, require additional testing",
+                    "❌ REJECT - High compliance risk, changes required",
+                    "🔍 REQUEST REVIEW - Need additional compliance team review",
+                ],
+            )
+
+            # Raise the clarification to pause execution and wait for human input
+            raise clarification
+
+        except MultipleChoiceClarification:
+            # Re-raise clarifications so Portia can handle them
+            raise
+        except Exception as e:
+            logger.error(f"Error creating approval clarification: {e}")
+            raise ToolHardError(f"Failed to create approval clarification: {e}")
+
+
 class EvidenceItem(BaseModel):
     control_id: str
     summary: str
@@ -401,16 +471,48 @@ class ComplianceAgent:
         default_model="google/gemini-2.0-flash",
         google_api_key=settings.gemini_api_key,
     )
-
-    my_tool_registry = ToolRegistry(
+    tools = DefaultToolRegistry(
+        config=config,
+    ) + InMemoryToolRegistry.from_local_tools(
         [
             AnalyzePullRequestTool(),
             GenerateEvidenceBundleTool(),
             PersistResultsToDbTool(),
+            CreateApprovalClarificationTool(),
         ]
     )
+    if not tools.get_tool("portia:slack:bot:send_message"):
+        raise ValueError(
+            "Slack boy tool not found. Please install on Portia "
+            "cloud by going to https://app.portialabs.ai/dashboard/tool-registry"
+        )
 
-    portia = Portia(config=config, tools=my_tool_registry)
+    portia = Portia(config=config, tools=tools)
+
+    def _extract_risk_level_from_data(self, pr_analysis) -> str:
+        """Safely extract risk level from PR analysis data, handling both JSON strings and dicts."""
+        try:
+            # Handle JSON string
+            if isinstance(pr_analysis, str):
+                try:
+                    data = json.loads(pr_analysis)
+                except json.JSONDecodeError:
+                    logger.warning("Failed to parse pr_analysis JSON string")
+                    return "LOW"
+            else:
+                data = pr_analysis
+
+            # Extract risk_level from dict
+            if isinstance(data, dict):
+                risk_level = data.get("risk_level", "LOW")
+                return str(risk_level).upper()
+
+            logger.warning(f"Unexpected pr_analysis type: {type(data)}")
+            return "LOW"
+
+        except Exception as e:
+            logger.error(f"Error extracting risk level: {e}")
+            return "LOW"
 
     def build_text_plan(
         self,
@@ -699,6 +801,40 @@ class ComplianceAgent:
                 ],
                 step_name="draft_evidence",
             )
+            # Extract risk level for conditional logic
+            .function_step(
+                step_name="extract_risk_level",
+                function=self._extract_risk_level_from_data,
+                args={"pr_analysis": StepOutput("extract_pr_analysis")},
+            )
+            # Conditional branch: if risk is MEDIUM or above, require human approval
+            .if_(
+                condition=lambda risk_level: str(risk_level)
+                in ["MEDIUM", "HIGH", "CRITICAL"],
+                args={"risk_level": StepOutput("extract_risk_level")},
+            )
+            # Send Slack notification for compliance team review
+            .invoke_tool_step(
+                tool="portia:slack:bot:send_message",
+                args={
+                    "target_id": "compliance-alerts",
+                    "message": f"""🚨 Compliance Review Required - {StepOutput('compute_pr_id')}
+                                Risk level - {StepOutput('extract_risk_level')}.
+                               """,
+                },
+                step_name="send_slack_notification",
+            )
+            # Raise clarification for human approval
+            .invoke_tool_step(
+                step_name="request_approval",
+                tool="create_approval_clarification",
+                args={
+                    "pr_id": StepOutput("compute_pr_id"),
+                    "risk_level": StepOutput("extract_risk_level"),
+                    "evidence": StepOutput("extract_evidence_bundle"),
+                },
+            )
+            .endif()
             .final_output(output_schema=FinalOutput, summarize=True)
         )
         return builder.build()
@@ -709,7 +845,7 @@ class ComplianceAgent:
         pr_number: int,
         policy_refs: Optional[List[str]] = None,
         demo: bool = False,
-    ) -> Any:
+    ) -> PlanRun:
         """
         Execute using PlanBuilderV2 approach for more structured control.
         This method builds an explicit plan and then runs it.

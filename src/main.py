@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from portia import PlanRunState, MultipleChoiceClarification
 
 from .config import settings
 from .models import get_session, PRAnalysisDB, EvidenceBundleDB
@@ -75,7 +76,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "agent_status": compliance_agent.get_agent_stats(),
+        "agent_ready": True,
     }
 
 
@@ -86,7 +87,7 @@ async def execute_compliance_analysis(
     demo: bool = False,
 ):
     """
-    Execute the Portia-based compliance analysis.
+    Execute the Portia-based compliance analysis with clarification handling.
 
     Args:
         repo_name: Repository name (e.g., "org/repo")
@@ -96,7 +97,7 @@ async def execute_compliance_analysis(
     """
     try:
         logger.info(f"🚀 Starting compliance analysis for {repo_name}#{pr_number}")
-        logger.info("⚙️ Using structured plan execution")
+        logger.info("⚙️ Using structured plan execution with human-in-the-loop")
 
         plan_result = await compliance_agent.run_plan(
             repo_name=repo_name,
@@ -104,6 +105,34 @@ async def execute_compliance_analysis(
             policy_refs=policy_refs or [],
             demo=demo,
         )
+
+        # Handle clarifications if the plan is paused
+        while plan_result.state == PlanRunState.NEED_CLARIFICATION:
+            logger.info(f"🔄 Plan paused for clarification: {repo_name}#{pr_number}")
+
+            # Log outstanding clarifications
+            clarifications = plan_result.get_outstanding_clarifications()
+            for clarification in clarifications:
+                # logger.info(f"📋 Clarification required: {clarification.user_guidance[:200]}...")
+
+                logger.info(f"{clarification.user_guidance}")
+                user_input = input(
+                    "please enter a value:\n"
+                    + (
+                        ("\n".join(clarification.options) + "\n")
+                        if isinstance(clarification, MultipleChoiceClarification)
+                        else ""
+                    )
+                )
+
+            plan_result = compliance_agent.portia.resolve_clarification(
+                clarification=clarification, response=user_input, plan_run=plan_result
+            )
+
+            # Continue plan execution
+            plan_result = await compliance_agent.portia.aresume(
+                plan_run_id=plan_result.id
+            )
 
         logger.info(f"✅ Compliance analysis completed for {repo_name}#{pr_number}")
 
@@ -289,18 +318,20 @@ async def list_analyses(limit: int = 20, db: Session = Depends(get_db)):
 @app.get("/agent/stats")
 async def get_agent_stats():
     """Get agent statistics and configuration"""
-    stats = compliance_agent.get_agent_stats()
-    stats.update(
-        {
-            "webhook_configured": bool(settings.github_webhook_secret),
-            "database_url": (
-                settings.database_url.split("@")[-1]
-                if "@" in settings.database_url
-                else "local"
-            ),
-        }
-    )
-    return stats
+    return {
+        "agent_ready": True,
+        "webhook_configured": bool(settings.github_webhook_secret),
+        "database_url": (
+            settings.database_url.split("@")[-1]
+            if "@" in settings.database_url
+            else "local"
+        ),
+        "features": [
+            "human_in_the_loop",
+            "slack_integration",
+            "clarification_workflow",
+        ],
+    }
 
 
 if __name__ == "__main__":
