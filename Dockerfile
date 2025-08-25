@@ -1,6 +1,6 @@
 # Multi-stage Dockerfile for Compliance Copilot
 # Stage 1: Base Python image with system dependencies
-FROM python:3.11-slim as base
+FROM python:3.12-slim as base
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -13,13 +13,21 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     build-essential \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Create app user with proper home directory
+RUN groupadd -r appuser && useradd -r -g appuser -m appuser
 
 # Set work directory
 WORKDIR /app
+
+# Set up npm for non-root user
+RUN mkdir -p /home/appuser/.npm-global && \
+    chown -R appuser:appuser /home/appuser/.npm-global
+ENV NPM_CONFIG_PREFIX=/home/appuser/.npm-global
+ENV PATH=/home/appuser/.npm-global/bin:$PATH
 
 # Stage 2: Dependencies
 FROM base as dependencies
