@@ -156,7 +156,7 @@ DATABASE_URL=sqlite:///./compliance.db
 2. Add webhook URL: `https://your-domain.com/webhooks/github`
 3. Select "Pull requests" events
 4. Set content type to `application/json`
-5. Add your webhook secret (optional but recommended)
+5. Add your webhook secret 
 
 ### Manual Analysis
 
@@ -251,9 +251,6 @@ compliance-copilot/
 
 Once running, visit `http://localhost:8000/docs` for interactive Swagger documentation.
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## 🏆 Acknowledgments
 
